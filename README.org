@@ -26,7 +26,7 @@ It features a background listener thread, automatic ping/pong handling, UTF‑8 
 
 * API
 
-** Connection object
+*** Connection object
 
 A ~websocket-connection~ instance is created by ~connect~ or ~connect-url~.  
 Accessors:
@@ -34,7 +34,7 @@ Accessors:
 - ~conn-subprotocol~ → the negotiated subprotocol (string or ~nil~)
 - ~conn-closed-p~ → predicate, returns ~t~ when the connection is not open.
 
-** ~connect~ host port path &key handler background origin protocols secure verify hostname
+*** ~connect~ host port path &key handler background origin protocols secure verify hostname
 
 Establish a WebSocket connection. Returns the connection object.
 
@@ -48,7 +48,7 @@ Establish a WebSocket connection. Returns the connection object.
 - ~verify~ – passed to ~cl+ssl:make-ssl-client-stream~ (default ~nil~).
 - ~hostname~ – optional SNI hostname (defaults to ~host~).
 
-** ~connect-url~ url &rest args
+*** ~connect-url~ url &rest args
 
 Parses ~ws://...~ or ~wss://...~ URLs and calls ~connect~.  
 All other keyword arguments are passed through.
@@ -57,7 +57,7 @@ All other keyword arguments are passed through.
 (connect-url "wss://echo.websocket.org")
 #+end_src
 
-** Handler callback
+*** Handler callback
 
 The handler function receives two values:
 - Event type – a keyword: ~:text~, ~:binary~, ~:ping~, ~:pong~, or ~:close~.
@@ -68,32 +68,32 @@ The handler function receives two values:
   (format t "~&[WS] ~A → ~S~%" type data))
 #+end_src
 
-** ~close-connection~ conn &optional code reason
+*** ~close-connection~ conn &optional code reason
 
 Initiate the WebSocket closing handshake (non‑blocking).  
 Default close code is 1000 (normal closure).  
 ~reason~ is a UTF‑8 string, truncated to ≤ 123 bytes.  
 After calling this, the connection state becomes ~:closing~ and will eventually transition to ~:closed~ (either after the peer replies or after the timeout).
 
-** ~wait-until-closed~ conn &optional timeout
+*** ~wait-until-closed~ conn &optional timeout
 
 Block the calling thread until the connection reaches ~:closed~.  
 ~timeout~ in seconds, ~nil~ means wait forever. Returns ~t~ on success, ~nil~ on timeout.
 
-** ~send-text~ conn string
+*** ~send-text~ conn string
 
 Send a text frame. String is encoded as UTF‑8.
 
-** ~send-binary~ conn octets
+*** ~send-binary~ conn octets
 
 Send a binary frame. Octets must be a ~(unsigned-byte 8)~ array.
 
-** ~send-ping~ conn &optional payload
+*** ~send-ping~ conn &optional payload
 
 Send a ping control frame. Payload ≤ 125 bytes.  
 The listener automatically replies with a pong; the user handler receives a ~:pong~ event.
 
-** ~run-message-loop~ conn
+*** ~run-message-loop~ conn
 
 If the connection was created with ~:background nil~, call this function in your thread to start the reading loop (blocks until the connection closes).
 
