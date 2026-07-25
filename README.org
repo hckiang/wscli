@@ -11,7 +11,6 @@ It features a background listener thread, automatic ping/pong handling, UTF‑8 
 - Thread‑safe design: one dedicated listener thread, arbitrary user threads can send frames or close the connection safely.
 - Automatic background message loop; alternatively, run the loop manually in the calling thread.
 - Callback‑based handler: receive events for text, binary, ping, pong, and close.
-- Optional subprotocol negotiation.
 - Closing handshake with configurable timeout and safe forced‑close fallback.
 
 * Dependencies
