@@ -64,16 +64,16 @@
            (return (if (zerop (length bytes))
                        nil
                        (babel:octets-to-string bytes :encoding :ascii))))
-          ((= b #x0a)                   ; LF  (or the LF of a CRLF)
+          ((= b #x0a)
            (return (babel:octets-to-string bytes :encoding :ascii)))
-          ((= b #x0d)                   ; CR
+          ((= b #x0d)
            (let ((next (read-byte stream nil nil)))
              (cond
-               ((null next)             ; CR + EOF → treat as end
+               ((null next)
                 (return (babel:octets-to-string bytes :encoding :ascii)))
-               ((= next #x0a)           ; proper CRLF
+               ((= next #x0a)
                 (return (babel:octets-to-string bytes :encoding :ascii)))
-               (t                       ; bare CR → illegal
+               (t
                 (error "Bare CR in HTTP header line")))))
           (t
            (vector-push-extend b bytes)))))))
@@ -343,13 +343,10 @@
            args)))
 
 (defun %try-finalize-close (conn)
-  "Atomically transition :closing → :closed (or no-op if already closed).
-   Returns T if *this* caller performed the transition (and is therefore
-   responsible for closing the transport and invoking the user handler)."
   (bt:with-lock-held ((conn-lock conn))
     (unless (eq (conn-state conn) :closed)
       (setf (conn-state conn) :closed)
-      (bt:condition-notify (conn-closed-cv conn)) ; also fixes the multi-waiter bug
+      (bt:condition-notify (conn-closed-cv conn))
       t)))
 
 (defun arm-close-timeout (conn)
@@ -362,13 +359,10 @@
            (when (conn-secure-p conn)
              (close (conn-stream conn)))
            (socket-close (conn-socket conn)))
-         ;; We won → we must deliver the callback (code 1006 = abnormal closure)
          (funcall (conn-handler conn) :close 1006)))
      :name "ws-close-timeout")))
 
 (defun utf8-truncate (string max-bytes)
-  "Return the longest prefix of STRING whose UTF-8 encoding
-   is at most MAX-BYTES long.  The result is always valid UTF-8."
   (let ((byte-len 0)
         (end 0))
     (loop for i from 0 below (length string)
@@ -384,12 +378,11 @@
     (subseq string 0 end)))
 
 (defun close-connection (conn &optional (code 1000) (reason ""))
-  "Initiate the WebSocket closing handshake (non-blocking)."
   (bt:with-lock-held ((conn-lock conn))
     (when (eq (conn-state conn) :open)
       (unless (valid-close-status-p code)
         (setf code 1000))
-      (let* ((reason (utf8-truncate reason 123))          ; ← character-safe
+      (let* ((reason (utf8-truncate reason 123))
              (reason-bytes (babel:string-to-octets reason :encoding :utf-8))
              (payload (make-array (+ 2 (length reason-bytes))
                                   :element-type '(unsigned-byte 8))))
@@ -463,7 +456,6 @@
                        (babel-encodings:character-decoding-error ()
                          (close-connection conn 1007 "Invalid UTF-8")
                          (finish-close 1007)))
-                     ;; Binary frames are opaque
                      (progn
                        (funcall handler :binary payload)
                        (setf msg-opcode nil
@@ -574,7 +566,7 @@
 (ql:quickload '(:usocket :cl+ssl :ironclad :cl-base64 :babel))
 
 (defun my-handler (type data)
-  (format t "~&[WS] ~A → ~S~%" type data))
+  (format t "~&[WS] ~A: ~S~%" type data))
 
 (defparameter conn (connect "echo.websocket.org" 443 "/"
                      :secure t

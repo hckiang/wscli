@@ -11,27 +11,18 @@ It features a background listener thread, automatic ping/pong handling, UTF‑8 
 - Thread‑safe design: one dedicated listener thread, arbitrary user threads can send frames or close the connection safely.
 - Automatic background message loop; alternatively, run the loop manually in the calling thread.
 - Callback‑based handler: receive events for text, binary, ping, pong, and close.
-- Closing handshake with configurable timeout and safe forced‑close fallback.
 
 * Dependencies
 
-- [[https://common-lisp.net/project/usocket/][usocket]] – TCP sockets.
-- [[https://github.com/cl-plus-ssl/cl-plus-ssl][cl+ssl]] – SSL/TLS for secure connections.
-- [[https://github.com/sharplispers/ironclad][ironclad]] – cryptographic randomness and SHA‑1.
-- [[https://github.com/cl-base64/cl-base64][cl-base64]] – Base64 encoding.
-- [[https://github.com/cl-babel/babel][babel]] – UTF‑8 encoding/decoding.
-- [[https://github.com/sionescu/bordeaux-threads][bordeaux‑threads]] (~bt~) – locks and condition variables.
-- [[https://github.com/quri/quri][quri]] – URL parsing (only for ~connect-url~).
+- usocket – TCP sockets.
+- cl+ssl – SSL/TLS for secure connections.
+- ironclad – cryptographic randomness and SHA‑1.
+- cl-base64 – Base64 encoding.
+- babel – UTF‑8 encoding/decoding.
+- bordeaux‑threads – locks and condition variables.
+- quri – URL parsing.
 
 * API
-
-*** Connection object
-
-A ~websocket-connection~ instance is created by ~connect~ or ~connect-url~.  
-Accessors:
-- ~conn-state~ → ~:open~, ~:closing~, or ~:closed~
-- ~conn-subprotocol~ → the negotiated subprotocol (string or ~nil~)
-- ~conn-closed-p~ → predicate, returns ~t~ when the connection is not open.
 
 *** ~connect~ host port path &key handler background origin protocols secure verify hostname
 
@@ -60,11 +51,11 @@ All other keyword arguments are passed through.
 
 The handler function receives two values:
 - Event type – a keyword: ~:text~, ~:binary~, ~:ping~, ~:pong~, or ~:close~.
-- Payload – a string for ~:text~, a ~(simple-array (unsigned-byte 8))~ for ~:binary~/~:ping~/~:pong~, and the close code for ~:close~.
+- Payload – a string for ~:text~, a ~(simple-array (unsigned-byte 8))~ for ~:binary~, ~:ping~, or ~:pong~, and the close code for ~:close~.
 
 #+begin_src lisp
 (defun my-handler (type data)
-  (format t "~&[WS] ~A → ~S~%" type data))
+  (format t "~&[WS] ~A: ~S~%" type data))
 #+end_src
 
 *** ~close-connection~ conn &optional code reason
@@ -157,15 +148,6 @@ If the connection was created with ~:background nil~, call this function in your
 - All writes from application threads are serialised and checked against the connection state; an error is signalled if the connection is not open (control frames are still allowed during the closing handshake).
 - The closing timeout thread ensures the listener never blocks forever waiting for the peer’s close response.
 - Multiple concurrent calls to ~close-connection~ are harmless; only the first one takes effect.
-
-* Closing behaviour
-
-RFC 6455 mandates an orderly closing handshake:
-1. Application calls ~close-connection~ → a close frame is sent, state → ~:closing~.
-2. The peer replies with its own close frame; the listener state → ~:closed~ and the socket is closed.
-3. If the peer never replies, a separate watchdog thread closes the socket after ~close-timeout~ seconds (default 1.5 s), transitioning the connection to ~:closed~.
-
-Calling ~close-connection~ from inside the handler (e.g. in response to a server message) is perfectly safe.
 
 * License
 
