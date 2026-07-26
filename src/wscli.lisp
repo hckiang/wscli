@@ -1,22 +1,5 @@
 ;;;; RFC 6455 WebSocket client
 
-(defpackage :wscli
-  (:use :cl :usocket)
-  (:export
-   #:websocket-connection
-   #:connect
-   #:connect-url
-   #:close-connection
-   #:wait-until-closed
-   #:send-text
-   #:send-binary
-   #:send-ping
-   #:run-message-loop
-   #:conn-subprotocol
-   #:conn-closed-p
-   #:conn-secure-p
-   #:conn-close-code))
-
 (in-package :wscli)
 
 (defun make-websocket-key ()
@@ -76,7 +59,8 @@
                ((= next #x0a)
                 (return (babel:octets-to-string bytes :encoding :ascii)))
                (t
-                (error "Bare CR in HTTP header line")))))
+                ;; HTTP/1.1 receivers are allowed to accept bare LF for robustness (RFC 7230 §3.5)
+                (error 'handshake-bare-cr-error)))))
           (t
            (vector-push-extend b bytes)))))))
 
@@ -101,11 +85,11 @@
 
 (defun valid-close-status-p (code)
   (or (<= 1000 code 1003)
-      (<= 1007 code 1014)          ; 1012–1014 are registered; harmless to accept
+      (<= 1007 code 1014)  ; 1012–1014 are in for example RFC 8441; harmless to accept
       (<= 3000 code 4999)))
 
 (defun parse-http-status-line (line)
-  (when (and line (>= (length line) 12)) ; "HTTP/1.x YYY"
+  (when (and line (>= (length line) 12)) ; "HTTP/1.x YYY" because §4.1: "... HTTP version MUST be at least 1.1."
     (let* ((sp1 (position #\Space line))
            (sp2 (and sp1 (position #\Space line :start (1+ sp1)))))
       (when (and sp1 sp2)
@@ -146,7 +130,7 @@
           (parse-http-status-line status)
         (declare (ignore version reason))
         (unless (eql code 101)
-          (error "WebSocket handshake failed: ~A" status))))
+          (error 'handshake-http-error :status-code code :response-line status))))
     ;; Headers
     (let ((got-accept nil)
           (got-upgrade nil)
@@ -161,13 +145,19 @@
              (let ((val (string-trim '(#\Space #\Tab)
                                      (subseq line (1+ (position #\: line))))))
                (unless (string= val accept)
-                 (error "Invalid Sec-WebSocket-Accept"))
+                 (error 'handshake-header-error
+                        :header-name "Sec-WebSocket-Accept"
+                        :received-value val
+                        :expected-value accept))
                (setf got-accept t)))
             ((search "Upgrade:" line :test #'char-equal)
              (let ((val (string-trim '(#\Space #\Tab)
                                      (subseq line (1+ (position #\: line))))))
                (unless (string-equal val "websocket")
-                 (error "Invalid Upgrade header: ~A" val))
+                 (error 'handshake-header-error
+                        :header-name "Upgrade"
+                        :received-value val
+                        :expected-value "websocket"))
                (setf got-upgrade t)))
             ((search "Connection:" line :test #'char-equal)
              (let ((val (string-trim '(#\Space #\Tab)
@@ -192,20 +182,18 @@
              (let ((val (string-trim '(#\Space #\Tab)
                                      (subseq line (1+ (position #\: line))))))
                (unless (string= val "")
-                 (error "Sec-WebSocket-Extensions present but no extensions were requested: ~A"
-                        val)))))))
+                 (error 'handshake-extension-error :extension-header val)))))))
       (unless got-accept
-        (error "Missing Sec-WebSocket-Accept header"))
+        (error 'handshake-header-error :header-name "Sec-WebSocket-Accept"))
       (unless got-upgrade
-        (error "Missing or invalid Upgrade header"))
+        (error 'handshake-header-error :header-name "Upgrade"))
       (unless got-connection
-        (error "Missing or invalid Connection header"))
+        (error 'handshake-header-error :header-name "Connection"))
       ;; RFC 6455 §4.1: negotiated subprotocol must have been offered by the client
       (when negotiated-proto
         (unless (and protocols
                      (member negotiated-proto protocols :test #'string=))
-          (error "Invalid or unrequested Sec-WebSocket-Protocol: ~A"
-                 negotiated-proto)))
+          (error 'handshake-subprotocol-error :negotiated-protocol negotiated-proto)))
       negotiated-proto)))
 
 
@@ -224,9 +212,9 @@
     ;; Control-frame constraints (RFC 6455 §5.5)
     (when (member opcode '(#x8 #x9 #xA))
       (when (> len 125)
-        (error "Control frame payload too large (~D > 125)" len))
+        (error 'control-frame-too-large-error :size len :message "Control frame payload too large"))
       (when (not fin)
-        (error "Control frames must not be fragmented")))
+        (error 'fragmented-control-frame-error :message "Control frames must not be fragmented")))
     (write-byte b0 stream)
     (write-byte b1 stream)
     (cond
@@ -247,7 +235,7 @@
       ;; Allow control frames (8,9,A) even while closing.
       (unless (or (eq state :open)
                   (and (eq state :closing) (member opcode '(#x8 #x9 #xA))))
-        (error "Connection is closed")))
+        (error 'connection-closed-error)))
     (write-frame (conn-stream conn) opcode payload :fin fin :mask mask)))
 
 
@@ -260,16 +248,17 @@
          (masked (logbitp 7 b1))
          (len (logand b1 #x7f)))
     (when (plusp rsv)
-      (error "RSV bits set (0x~X) but no extension negotiated" rsv))
+      (error 'reserved-bits-error :rsv-bits rsv))
     (when masked
-      (error "Server sent a masked frame (MASK bit must be 0)"))
+      (error 'masked-frame-from-server-error))
     (cond
       ((= len 126)
        (let ((extended (+ (ash (read-byte stream) 8)
                           (read-byte stream))))
          (when (< extended 126)
-           (error "Non-minimal payload length encoding (126 used for ~D)"
-                  extended))
+           (error 'non-minimal-payload-length-error
+                  :actual-length extended
+                  :declared-length 126))
          (setf len extended)))
       ((= len 127)
        (let ((extended 0)
@@ -281,10 +270,11 @@
              (setf extended (+ (ash extended 8) b))))
          ;; Most-significant bit of the 64-bit length MUST be 0
          (when (logbitp 7 first-byte)
-           (error "Payload length 64-bit value has MSB set"))
+           (error 'payload-msb-set-error))
          (when (< extended 65536)
-           (error "Non-minimal payload length encoding (127 used for ~D)"
-                  extended))
+           (error 'non-minimal-payload-length-error
+                  :actual-length extended
+                  :declared-length 127))
          (setf len extended))))
     (let ((data (read-exact stream len)))
       (values opcode data fin))))
@@ -340,10 +330,15 @@
          (scheme (string-downcase (or (quri:uri-scheme uri) "")))
          (secure (cond ((string= scheme "wss") t)
                        ((string= scheme "ws")  nil)
-                       (t (error "Unsupported scheme ~S in ~S (expected \"ws\" or \"wss\")"
-                                 scheme url))))
+                       (t
+                        (error 'handshake-url-error
+                               :url url
+                               :reason (format nil "Unsupported scheme ~S in ~S (expected \"ws\" or \"wss\")"
+                                               scheme url)))))
          (host   (or (quri:uri-host uri)
-                     (error "Missing host in URL ~S" url)))
+                     (error 'handshake-url-error
+                            :url url
+                            :reason (format nil "Missing host in URL ~S" url))))
          (port   (or (quri:uri-port uri)
                      (if secure 443 80)))
          (path   (let ((p (or (quri:uri-path uri) "/"))
@@ -424,20 +419,20 @@
 
 (defun send-text (conn text)
   (when (conn-closed-p conn)
-    (error "Connection is closed"))
+    (error 'connection-closed-error))
   (write-frame-locked conn #x1
                       (babel:string-to-octets text :encoding :utf-8)))
 
 (defun send-binary (conn data)
   (when (conn-closed-p conn)
-    (error "Connection is closed"))
+    (error 'connection-closed-error))
   (write-frame-locked conn #x2 data))
 
 (defun send-ping (conn &optional (payload #()))
   (when (conn-closed-p conn)
-    (error "Connection is closed"))
+    (error 'connection-closed-error))
   (when (> (length payload) 125)
-    (error "Ping payload too large (~D > 125 bytes)" (length payload)))
+    (error 'ping-payload-too-big-error :n-bytes (length payload)))
   (write-frame-locked conn #x9 payload))
 
 (defun concatenate-byte-vectors (parts)
@@ -499,19 +494,14 @@
                    (cond
                      ((member opcode '(#x8 #x9 #xA))
                       (unless fin
-                        (close-connection conn 1002 "Fragmented control frame")
-                        (finish-close 1002)
-                        )
+                        (error 'fragmented-control-frame-error))
                       (unless (<= (length payload) 125)
-                        (close-connection conn 1002 "Control frame payload too large")
-                        (finish-close 1002)
-                        )
+                        (error 'control-frame-too-large-error))
                       (case opcode
                         (#x8
                          (cond
                            ((= (length payload) 1)
-                            (close-connection conn 1002 "Invalid close payload length")
-                            (finish-close 1002))
+                            (error 'invalid-close-payload-error))
                            (t
                             (let* ((code (if (zerop (length payload))
                                              1005
@@ -522,14 +512,14 @@
                                                      #())))
                               (when (plusp (length payload))
                                 (unless (valid-close-status-p code)
-                                  (close-connection conn 1002 "Invalid close status code")
-                                  (finish-close 1002)))
+                                  (error 'invalid-close-code-error :received-code code)))
                               (when (plusp (length reason-bytes))
                                 (handler-case
                                     (babel:octets-to-string reason-bytes :encoding :utf-8 :errorp t)
                                   (babel-encodings:character-decoding-error ()
-                                    (close-connection conn 1007 "Invalid UTF-8 in close reason")
-                                    (finish-close 1007))))
+                                    (error 'invalid-utf8-error
+                                           :context :close-reason
+                                           :octets reason-bytes))))
                               ;; Reply (or no-op if we already sent a Close) then finish.
                               (close-connection conn (if (zerop (length payload)) 1000 code))
                               (finish-close code)))))
@@ -542,24 +532,22 @@
                       (cond
                         ((null msg-opcode)
                          (when (= opcode #x0)
-                           (close-connection conn 1002 "Unexpected continuation frame")
-                           (finish-close 1002)
-                           )
+                           (error 'unexpected-continuation-frame-error))
                          (setf msg-opcode opcode
                                msg-parts  (list payload))
                          (when fin
                            (deliver-message)))
                         (t
                          (unless (= opcode #x0)
-                           (close-connection conn 1002 "Unexpected non-continuation frame during fragmented message")
-                           (finish-close 1002)
-                           )
+                           (error 'unexpected-data-frame-error :received-opcode opcode))
                          (push payload msg-parts)
                          (when fin
                            (deliver-message)))))
                      (t
-                      (close-connection conn 1002 (format nil "Unknown opcode ~A" opcode))
-                      (finish-close 1002)))
+                      (error 'unknown-opcode-error :opcode opcode)))
+                 (protocol-error (c)
+                   (close-connection conn (protocol-error-close-code c) (protocol-error-message c))
+                   (finish-close (protocol-error-close-code c)))
                  (error (e)
                    ;; If close-connection from other thread causes the state to flip from :open
                    ;; to :closing or :closed, sending of message might signal. In this case
@@ -570,8 +558,7 @@
                      (warn "WebSocket listener error: ~A" e)
                      (ignore-errors
                       (close-connection conn 1002 "Listener error")))
-                   (finish-close 1002))
-                 )))
+                   (finish-close 1002)))))
         (ignore-errors
          (if (conn-secure-p conn)
              (progn

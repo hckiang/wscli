@@ -11,4 +11,9 @@
                "babel"
                "bordeaux-threads")
   :serial t
-  :components ((:file "wscli")))
+  :components ((:module "wscli"
+                :pathname "src/"
+                :serial t
+                :components ((:file "package")
+                             (:file "conditions")
+                             (:file "wscli")))))
