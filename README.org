@@ -1,25 +1,22 @@
-* wscli – RFC 6455 WebSocket Client for Common Lisp
+* wscli – WebSocket Client for Common Lisp
 
-A multi‑threaded, thread‑safe WebSocket client library that strictly follows RFC 6455.  
-It features a background listener thread, automatic ping/pong handling, UTF‑8 validation, and a correct closing handshake with timeout.
+A Common Lisp thread‑safe WebSocket client library.
 
-** Features
+** Why a new library?
 
-- Full RFC 6455 compliance (control frames, fragmentation, masking, close codes).
-- Secure connections (WSS) via ~cl+ssl~ with SNI support.
-- Thread‑safe design: one dedicated listener thread, arbitrary user threads can send frames or close the connection safely.
-- Automatic background message loop; alternatively, run the loop manually in the calling thread.
-- Callback‑based handler: receive events for text, binary, ping, pong, and close.
+~wscli~ is made for the use case where a long-running Lisp process must continuously
+connects and disconnects to multiple sockets. None of the existing web socket client libraries
+are satisfactory for this use case as of 2026.
 
-** Dependencies
-
-- usocket – TCP sockets.
-- cl+ssl – SSL/TLS for secure connections.
-- ironclad – cryptographic randomness and SHA‑1.
-- cl-base64 – Base64 encoding.
-- babel – UTF‑8 encoding/decoding.
-- bordeaux‑threads – locks and condition variables.
-- quri – URL parsing.
+Although there are a few Common Lisp web socket libraries, most of them focus on server but not
+the client side. Among web socket clients on the market, Allergo's aserve client seems to be the most
+mature but it is not open source. ~wet-sprockets~ uses global variable and looks a bit incomplete.
+While fukamachi's popular ~websocket-driver~ contains a performant client that works excellently for
+most typical use, it is less designed with concurrency and robust long-running services in mind
+compared to ~wscli~. For example, ~wscli~ has provides better thread-safety for multiple threads
+writing to the same socket and some requests closing; ~wscli~ also does safer gentle shutdown
+(the user's handler code can be in a foreign library doing any side-effects and we should wait
+for it to finish).
 
 ** API
 
@@ -140,9 +137,8 @@ If the connection was created with ~:background nil~, call this function in your
 
 ** Thread‑safety
 
-- The library uses a single lock (~conn-lock~) to protect internal state.
-- The listener thread never invokes user code while holding the lock; you can safely call ~close-connection~, ~send-text~, etc. from inside the handler without deadlocking.
-- The closing timeout thread ensures the listener never blocks forever waiting for the peer’s close response.
+- Writing from multiple threads is fine.
+- You can safely call ~close-connection~, ~send-text~, etc. from inside the handler.
 - Multiple concurrent calls to ~close-connection~ are harmless; only the first one takes effect.
 
 ** License
