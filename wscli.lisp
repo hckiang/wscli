@@ -91,7 +91,8 @@
    (closed-cv    :initform (bt:make-condition-variable)
                  :accessor conn-closed-cv)
    (close-timeout :initarg :close-timeout :initform 1.5
-                  :accessor conn-close-timeout)))
+                  :accessor conn-close-timeout)
+   (close-code   :initform 1006 :accessor conn-close-code)))
 
 (defun conn-closed-p (conn)
   (not (eq (conn-state conn) :open)))
@@ -302,7 +303,7 @@
                      (cl+ssl:make-ssl-client-stream
                       raw-stream
                       :hostname (or hostname host)
-                      :unwrap-stream-p t
+                      :unwrap-stream-p nil
                       :verify (or verify nil))
                      raw-stream))
          (proto (perform-handshake stream host path
@@ -342,10 +343,11 @@
            :secure secure
            args)))
 
-(defun %try-finalize-close (conn)
+(defun %try-finalize-close (conn &optional (code 1006))
   (bt:with-lock-held ((conn-lock conn))
     (unless (eq (conn-state conn) :closed)
-      (setf (conn-state conn) :closed)
+      (setf (conn-state conn) :closed
+            (conn-close-code conn) code)
       (bt:condition-notify (conn-closed-cv conn))
       t)))
 
@@ -354,13 +356,13 @@
     (bt:make-thread
      (lambda ()
        (sleep timeout)
-       (when (%try-finalize-close conn)          ; win the race?
+       ;; Only set the state + unblock the reader.
+       ;; NEVER close the stream/socket from this thread.
+       (when (%try-finalize-close conn 1006)
          (ignore-errors
-           (when (conn-secure-p conn)
-             (close (conn-stream conn)))
-           (socket-close (conn-socket conn)))
-         (funcall (conn-handler conn) :close 1006)))
+           (socket-shutdown (conn-socket conn) :input))))
      :name "ws-close-timeout")))
+
 
 (defun utf8-truncate (string max-bytes)
   (let ((byte-len 0)
@@ -461,104 +463,124 @@
                        (setf msg-opcode nil
                              msg-parts  nil)))))
              (finish-close (code)
-               (when (%try-finalize-close conn)
-                 (ignore-errors
-                  (when (conn-secure-p conn)
-                    (close (conn-stream conn)))
-                  (socket-close (conn-socket conn)))
-                 (funcall handler :close code))
+               ;; Just force the state machine and leave the loop.
+               ;; Resource cleanup + handler delivery happen in the
+               ;; unwind-protect below.
+               (%try-finalize-close conn code)
+               ;; (when (%try-finalize-close conn)
+               ;;   (ignore-errors
+               ;;    (when (conn-secure-p conn)
+               ;;      (close (conn-stream conn)))
+               ;;    (socket-close (conn-socket conn)))
+               ;;   (funcall handler :close code))
                (return-from run-message-loop)))
-      (loop
-        (when (eq (conn-state conn) :closed)
-          (return))
+      (unwind-protect
+           (loop
+             (when (eq (conn-state conn) :closed)
+               (return))
 
-        (multiple-value-bind (opcode payload fin)
-            (handler-case (read-frame stream)
-              (end-of-file ()
-                (finish-close 1006))
-              (error (e)
-                (warn "Frame read error: ~A" e)
-                (unless (conn-closed-p conn)
-                  (close-connection conn 1002 "Protocol error"))
-                (finish-close 1002)))
+             (multiple-value-bind (opcode payload fin)
+                 (handler-case (read-frame stream)
+                   (end-of-file ()
+                     (finish-close 1006))
+                   (error (e)
+                     (warn "Frame read error: ~A" e)
+                     (unless (conn-closed-p conn)
+                       (close-connection conn 1002 "Protocol error"))
+                     (finish-close 1002)))
 
-          (handler-case 
-              (cond
-                ((member opcode '(#x8 #x9 #xA))
-                 (unless fin
-                   (close-connection conn 1002 "Fragmented control frame")
-                   (finish-close 1002)
-                   )
-                 (unless (<= (length payload) 125)
-                   (close-connection conn 1002 "Control frame payload too large")
-                   (finish-close 1002)
-                   )
-                 (case opcode
-                   (#x8
-                    (cond
-                      ((= (length payload) 1)
-                       (close-connection conn 1002 "Invalid close payload length")
-                       (finish-close 1002))
-                      (t
-                       (let* ((code (if (zerop (length payload))
-                                        1005
-                                        (+ (ash (aref payload 0) 8)
-                                           (aref payload 1))))
-                              (reason-bytes (if (> (length payload) 2)
-                                                (subseq payload 2)
-                                                #())))
-                         (when (plusp (length payload))
-                           (unless (valid-close-status-p code)
-                             (close-connection conn 1002 "Invalid close status code")
-                             (finish-close 1002)))
-                         (when (plusp (length reason-bytes))
-                           (handler-case
-                               (babel:octets-to-string reason-bytes :encoding :utf-8 :errorp t)
-                             (babel-encodings:character-decoding-error ()
-                               (close-connection conn 1007 "Invalid UTF-8 in close reason")
-                               (finish-close 1007))))
-                         ;; Reply (or no-op if we already sent a Close) then finish.
-                         (close-connection conn (if (zerop (length payload)) 1000 code))
-                         (finish-close code)))))
-                   (#x9
-                    (ignore-errors (write-frame-locked conn #xA payload))
-                    (funcall handler :ping payload))
-                   (#xA
-                    (funcall handler :pong payload))))
-                ((or (= opcode #x1) (= opcode #x2) (= opcode #x0))
-                 (cond
-                   ((null msg-opcode)
-                    (when (= opcode #x0)
-                      (close-connection conn 1002 "Unexpected continuation frame")
-                      (finish-close 1002)
-                      )
-                    (setf msg-opcode opcode
-                          msg-parts  (list payload))
-                    (when fin
-                      (deliver-message)))
-                   (t
-                    (unless (= opcode #x0)
-                      (close-connection conn 1002 "Unexpected non-continuation frame during fragmented message")
-                      (finish-close 1002)
-                      )
-                    (push payload msg-parts)
-                    (when fin
-                      (deliver-message)))))
-                (t
-                 (close-connection conn 1002 (format nil "Unknown opcode ~A" opcode))
-                 (finish-close 1002)))
-            (error (e)
-              ;; If close-connection from other thread causes the state to flip from :open
-              ;; to :closing or :closed, sending of message might signal. In this case
-              ;; this handler catches that and it's an no-op. Otherwise if the state is still
-              ;; :open, it's an unexpected error that needs warning and we close the connection
-              ;; immediately.
-              (unless (conn-closed-p conn)
-                (warn "WebSocket listener error: ~A" e)
-                (ignore-errors
-                 (close-connection conn 1002 "Listener error")))
-              (finish-close 1002))
-            ))))))
+               (handler-case 
+                   (cond
+                     ((member opcode '(#x8 #x9 #xA))
+                      (unless fin
+                        (close-connection conn 1002 "Fragmented control frame")
+                        (finish-close 1002)
+                        )
+                      (unless (<= (length payload) 125)
+                        (close-connection conn 1002 "Control frame payload too large")
+                        (finish-close 1002)
+                        )
+                      (case opcode
+                        (#x8
+                         (cond
+                           ((= (length payload) 1)
+                            (close-connection conn 1002 "Invalid close payload length")
+                            (finish-close 1002))
+                           (t
+                            (let* ((code (if (zerop (length payload))
+                                             1005
+                                             (+ (ash (aref payload 0) 8)
+                                                (aref payload 1))))
+                                   (reason-bytes (if (> (length payload) 2)
+                                                     (subseq payload 2)
+                                                     #())))
+                              (when (plusp (length payload))
+                                (unless (valid-close-status-p code)
+                                  (close-connection conn 1002 "Invalid close status code")
+                                  (finish-close 1002)))
+                              (when (plusp (length reason-bytes))
+                                (handler-case
+                                    (babel:octets-to-string reason-bytes :encoding :utf-8 :errorp t)
+                                  (babel-encodings:character-decoding-error ()
+                                    (close-connection conn 1007 "Invalid UTF-8 in close reason")
+                                    (finish-close 1007))))
+                              ;; Reply (or no-op if we already sent a Close) then finish.
+                              (close-connection conn (if (zerop (length payload)) 1000 code))
+                              (finish-close code)))))
+                        (#x9
+                         (ignore-errors (write-frame-locked conn #xA payload))
+                         (funcall handler :ping payload))
+                        (#xA
+                         (funcall handler :pong payload))))
+                     ((or (= opcode #x1) (= opcode #x2) (= opcode #x0))
+                      (cond
+                        ((null msg-opcode)
+                         (when (= opcode #x0)
+                           (close-connection conn 1002 "Unexpected continuation frame")
+                           (finish-close 1002)
+                           )
+                         (setf msg-opcode opcode
+                               msg-parts  (list payload))
+                         (when fin
+                           (deliver-message)))
+                        (t
+                         (unless (= opcode #x0)
+                           (close-connection conn 1002 "Unexpected non-continuation frame during fragmented message")
+                           (finish-close 1002)
+                           )
+                         (push payload msg-parts)
+                         (when fin
+                           (deliver-message)))))
+                     (t
+                      (close-connection conn 1002 (format nil "Unknown opcode ~A" opcode))
+                      (finish-close 1002)))
+                 (error (e)
+                   ;; If close-connection from other thread causes the state to flip from :open
+                   ;; to :closing or :closed, sending of message might signal. In this case
+                   ;; this handler catches that and it's an no-op. Otherwise if the state is still
+                   ;; :open, it's an unexpected error that needs warning and we close the connection
+                   ;; immediately.
+                   (unless (conn-closed-p conn)
+                     (warn "WebSocket listener error: ~A" e)
+                     (ignore-errors
+                      (close-connection conn 1002 "Listener error")))
+                   (finish-close 1002))
+                 )))
+        (ignore-errors
+         (if (conn-secure-p conn)
+             (progn
+               (close (conn-stream conn))
+               (socket-close (conn-socket conn)))
+             (socket-close (conn-socket conn))))
+        ;; If unwrap-stream-p is t we use the following, but the stubborn
+        ;; Clozure memory corruption problem seems to only occur if unwrap-stream-p
+        ;; is nil...? 
+        #|(ignore-errors
+            (if (conn-secure-p conn)
+                (close (conn-stream conn))
+                (socket-close (conn-socket conn))))|#
+        (funcall handler :close (conn-close-code conn))
+  ))))
 
 
 ;; Example usage
