@@ -145,3 +145,6 @@ If the connection was created with ~:background nil~, call this function in your
 
 BSD 2-clause.
 
+** Common Lisp Implementations
+
+The library is developed and tested on SBCL and Clozure CL.
