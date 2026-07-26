@@ -13,7 +13,9 @@
    #:send-ping
    #:run-message-loop
    #:conn-subprotocol
-   #:conn-closed-p))
+   #:conn-closed-p
+   #:conn-secure-p
+   #:conn-close-code))
 
 (in-package :wscli)
 
@@ -303,6 +305,16 @@
                      (cl+ssl:make-ssl-client-stream
                       raw-stream
                       :hostname (or hostname host)
+                      ;; :unwrap-stream-p t is supposedly more direct and faster, but it causes
+                      ;; FreeBSD Clozure CL to fail with corrupt memory inside the SSL library
+                      ;; for unknown reasons, especially under heavy load.
+                      ;;
+                      ;; Interestingly, fukamachi's websocket-driver fails the exact same way
+                      ;; on the same machine (they use :unwrap-stream-p t), so I believe this is
+                      ;; not a wscli bug per-se. For safety reasons, we use Lisp stream here.
+                      ;;
+                      ;; With Lisp streams, I haven't seen any memory corruptions under very heavy
+                      ;; load across multiple machines and both SBCL and CCL.
                       :unwrap-stream-p nil
                       :verify (or verify nil))
                      raw-stream))
@@ -438,8 +450,6 @@
       (incf pos (length p)))
     result))
 
-
-
 (defun run-message-loop (conn)
   (let ((stream      (conn-stream conn))
         (handler     (conn-handler conn))
@@ -467,28 +477,24 @@
                ;; Resource cleanup + handler delivery happen in the
                ;; unwind-protect below.
                (%try-finalize-close conn code)
-               ;; (when (%try-finalize-close conn)
-               ;;   (ignore-errors
-               ;;    (when (conn-secure-p conn)
-               ;;      (close (conn-stream conn)))
-               ;;    (socket-close (conn-socket conn)))
-               ;;   (funcall handler :close code))
                (return-from run-message-loop)))
       (unwind-protect
            (loop
              (when (eq (conn-state conn) :closed)
                (return))
-
              (multiple-value-bind (opcode payload fin)
                  (handler-case (read-frame stream)
                    (end-of-file ()
                      (finish-close 1006))
                    (error (e)
-                     (warn "Frame read error: ~A" e)
                      (unless (conn-closed-p conn)
+                       ;; This SSL warning can come from C and bubbles as a Lisp condition by cl+ssl
+                       ;; and can look scary, when read-frame fails during closing. They are harmless
+                       ;; if the connection is closing and we only warn about frame reading failure
+                       ;; when the connection is in non-closing state.
+                       (warn "Frame read error: ~A" e)
                        (close-connection conn 1002 "Protocol error"))
                      (finish-close 1002)))
-
                (handler-case 
                    (cond
                      ((member opcode '(#x8 #x9 #xA))
@@ -572,9 +578,7 @@
                (close (conn-stream conn))
                (socket-close (conn-socket conn)))
              (socket-close (conn-socket conn))))
-        ;; If unwrap-stream-p is t we use the following, but the stubborn
-        ;; Clozure memory corruption problem seems to only occur if unwrap-stream-p
-        ;; is nil...? 
+        ;; If unwrap-stream-p is t we use the following
         #|(ignore-errors
             (if (conn-secure-p conn)
                 (close (conn-stream conn))
