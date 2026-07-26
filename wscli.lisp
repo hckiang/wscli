@@ -583,31 +583,5 @@
             (if (conn-secure-p conn)
                 (close (conn-stream conn))
                 (socket-close (conn-socket conn))))|#
-        (funcall handler :close (conn-close-code conn))
-  ))))
+        (funcall handler :close (conn-close-code conn))))))
 
-
-;; Example usage
-#|
-(ql:quickload '(:usocket :cl+ssl :ironclad :cl-base64 :babel))
-
-(defun my-handler (type data)
-  (format t "~&[WS] ~A: ~S~%" type data))
-
-(defparameter conn (connect "echo.websocket.org" 443 "/"
-                     :secure t
-                     :verify nil          ; set to :optional or t in production
-                     :handler #'my-handler))
-(send-text conn "Hello secure WebSocket!")
-
-;;; Only use run-message-loop when :background is set to nil.
-;; (run-message-loop conn)
-
-(close-connection conn)
-
-(defparameter conn (connect "stream.binance.com" 9443 "/stream?streams=btcusdt@trade"
-                     :secure t
-                     :verify nil          ; set to :optional or t in production
-                     :handler #'my-handler))
-(close-connection conn)
-|#
