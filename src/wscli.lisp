@@ -76,17 +76,19 @@
    (subprotocol  :initform nil          :accessor conn-subprotocol)
    (secure-p     :initform nil          :accessor conn-secure-p)
    (listener-thread :initform nil :accessor conn-listener-thread)
-   (lock         :initform (bt:make-lock "ws-lock")
+   (lock         :initform (bt:make-recursive-lock "ws-lock")
                  :accessor conn-lock)
    (closed-cv    :initform (bt:make-condition-variable)
                  :accessor conn-closed-cv)
    (close-timeout :initarg :close-timeout :initform 1.5
                   :accessor conn-close-timeout)
-   (close-code   :initform 1006 :accessor conn-close-code)))
+   (close-code   :initform 1006 :accessor conn-close-code)
+   (close-reason :initform "" :accessor conn-close-reason)))
 
 (defun conn-closed-p (conn)
   (declare (type websocket-connection conn))
-  (not (eq (conn-state conn) :open)))
+  (bt:with-recursive-lock-held ((conn-lock conn))
+    (not (eq (conn-state conn) :open))))
 
 (defun valid-close-status-p (code)
   (declare (type integer code))
@@ -237,7 +239,7 @@
     (finish-output stream)))
 
 (defun write-frame-locked (conn opcode payload &key (fin t) (mask t))
-  (bt:with-lock-held ((conn-lock conn))
+  (bt:with-recursive-lock-held ((conn-lock conn))
     (let ((state (conn-state conn)))
       ;; Allow control frames (8,9,A) even while closing.
       (unless (or (eq state :open)
@@ -384,11 +386,12 @@
              :secure secure
              clean-args))))
 
-(defun %try-finalize-close (conn &optional (code 1006))
-  (bt:with-lock-held ((conn-lock conn))
+(defun %try-finalize-close (conn &optional (code 1006) (reason ""))
+  (bt:with-recursive-lock-held ((conn-lock conn))
     (unless (eq (conn-state conn) :closed)
       (setf (conn-state conn) :closed
-            (conn-close-code conn) code)
+            (conn-close-code conn) code
+            (conn-close-reason conn) reason)
       (bt:condition-notify (conn-closed-cv conn))
       t)))
 
@@ -425,7 +428,7 @@
 (defun close-connection (conn &optional (code 1000) (reason ""))
   (declare (type integer code)
            (type string reason))
-  (bt:with-lock-held ((conn-lock conn))
+  (bt:with-recursive-lock-held ((conn-lock conn))
     (when (eq (conn-state conn) :open)
       (unless (valid-close-status-p code)
         (setf code 1000))
@@ -443,7 +446,7 @@
         (arm-close-timeout conn)))))
 
 (defun wait-until-closed (conn &optional (timeout nil))
-  (bt:with-lock-held ((conn-lock conn))
+  (bt:with-recursive-lock-held ((conn-lock conn))
     (loop
       (when (eq (conn-state conn) :closed)
         (return t))
@@ -484,8 +487,7 @@
   (let ((stream      (conn-stream conn))
         (handler     (conn-handler conn))
         (msg-opcode  nil)   ; 1 = text, 2 = binary, NIL = no message in progress
-        (msg-parts   nil)   ; list of payload vectors (newest first)
-        (rfc6455-close-reason ""))      ; This is the reason string in the protocol
+        (msg-parts   nil))
     (labels ((deliver-message ()
                (let ((payload (concatenate-byte-vectors msg-parts)))
                  (if (= msg-opcode #x1)
@@ -508,13 +510,13 @@
                ;; Just force the state machine and leave the loop.
                ;; Resource cleanup + handler delivery happen in the
                ;; unwind-protect below.
-               (setf rfc6455-close-reason reason)
-               (%try-finalize-close conn code)
+               (%try-finalize-close conn code reason)
                (return-from run-message-loop)))
       (unwind-protect
            (loop
-             (when (eq (conn-state conn) :closed)
-               (return))
+             (bt:with-recursive-lock-held ((conn-lock conn))
+               (when (eq (conn-state conn) :closed)
+                 (return)))
              (multiple-value-bind (opcode payload fin)
                  (handler-case (read-frame stream)
                    (end-of-file ()
@@ -616,6 +618,8 @@
             (if (conn-secure-p conn)
                 (close (conn-stream conn))
                 (socket-close (conn-socket conn))))|#
-        (funcall handler :close (cons (conn-close-code conn)
-                                      rfc6455-close-reason))))))
+        (multiple-value-bind (code reason)
+            (bt:with-recursive-lock-held ((conn-lock conn))
+              (values (conn-close-code conn) (conn-close-reason conn)))
+          (funcall handler :close (cons code reason)))))))
 
