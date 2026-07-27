@@ -25,10 +25,14 @@
     result))
 
 (defun read-exact (stream n)
-  (let ((buf (make-array n :element-type '(unsigned-byte 8))))
-    (loop for i from 0 below n
-          do (setf (aref buf i) (read-byte stream)))
-    buf))
+  (let ((buf (make-array n :element-type '(unsigned-byte 8)))
+        (start 0))
+    (loop
+      (when (= start n) (return buf))
+      (let ((count (read-sequence buf stream :start start :end n)))
+        (when (zerop count)
+          (error 'end-of-file :stream stream))
+        (incf start count)))))
 
 (defun write-crlf (stream)
   (write-byte #x0d stream)
@@ -126,7 +130,7 @@
       (write-ascii-line stream
                         (format nil "Sec-WebSocket-Protocol: ~{~A~^, ~}" protocols)))
     (write-crlf stream)                 ; empty line
-    (force-output stream)
+    (finish-output stream)
     ;; Status line
     (let ((status (read-ascii-line stream)))
       (multiple-value-bind (version code reason)
@@ -230,7 +234,7 @@
     (when mask
       (write-sequence mask-key stream))
     (write-sequence masked stream)
-    (force-output stream)))
+    (finish-output stream)))
 
 (defun write-frame-locked (conn opcode payload &key (fin t) (mask t))
   (bt:with-lock-held ((conn-lock conn))
@@ -264,24 +268,21 @@
                   :declared-length 126))
          (setf len extended)))
       ((= len 127)
-       (let ((extended 0)
-             (first-byte nil))
-         (dotimes (i 8)
-           (let ((b (read-byte stream)))
-             (when (zerop i)
-               (setf first-byte b))
-             (setf extended (+ (ash extended 8) b))))
-         ;; Most-significant bit of the 64-bit length MUST be 0
-         (when (logbitp 7 first-byte)
-           (error 'payload-msb-set-error))
-         (when (< extended 65536)
-           (error 'non-minimal-payload-length-error
-                  :actual-length extended
-                  :declared-length 127))
-         (setf len extended))))
+       (let ((lenbuf (read-exact stream 8)))
+         (let ((extended 0)
+               (first-byte (aref lenbuf 0)))
+           (dotimes (i 8)
+             (setf extended (+ (ash extended 8) (aref lenbuf i))))
+           ;; Most-significant bit of the 64-bit length MUST be 0
+           (when (logbitp 7 first-byte)
+             (error 'payload-msb-set-error))
+           (when (< extended 65536)
+             (error 'non-minimal-payload-length-error
+                    :actual-length extended
+                    :declared-length 127))
+           (setf len extended)))))
     (let ((data (read-exact stream len)))
       (values opcode data fin))))
-
 
 (defun connect (host port path
                 &key (handler (lambda (type data) (declare (ignore type data))))
