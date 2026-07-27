@@ -81,14 +81,17 @@
    (close-code   :initform 1006 :accessor conn-close-code)))
 
 (defun conn-closed-p (conn)
+  (declare (type websocket-connection conn))
   (not (eq (conn-state conn) :open)))
 
 (defun valid-close-status-p (code)
+  (declare (type integer code))
   (or (<= 1000 code 1003)
       (<= 1007 code 1014)  ; 1012–1014 are in for example RFC 8441; harmless to accept
       (<= 3000 code 4999)))
 
 (defun parse-http-status-line (line)
+  (declare (type string line))
   (when (and line (>= (length line) 12)) ; "HTTP/1.x YYY" because §4.1: "... HTTP version MUST be at least 1.1."
     (let* ((sp1 (position #\Space line))
            (sp2 (and sp1 (position #\Space line :start (1+ sp1)))))
@@ -326,29 +329,59 @@
     conn))
 
 (defun connect-url (url &rest args &key &allow-other-keys)
-  (let* ((uri    (quri:uri url))
-         (scheme (string-downcase (or (quri:uri-scheme uri) "")))
-         (secure (cond ((string= scheme "wss") t)
-                       ((string= scheme "ws")  nil)
-                       (t
-                        (error 'handshake-url-error
-                               :url url
-                               :reason (format nil "Unsupported scheme ~S in ~S (expected \"ws\" or \"wss\")"
-                                               scheme url)))))
-         (host   (or (quri:uri-host uri)
-                     (error 'handshake-url-error
-                            :url url
-                            :reason (format nil "Missing host in URL ~S" url))))
-         (port   (or (quri:uri-port uri)
-                     (if secure 443 80)))
-         (path   (let ((p (or (quri:uri-path uri) "/"))
-                       (q (quri:uri-query uri)))
-                   (if q
-                       (concatenate 'string p "?" q)
-                       p))))
-    (apply #'connect host port path
-           :secure secure
-           args)))
+  (declare (type string url))
+  (let* ((uri      (quri:uri url))
+         (scheme   (string-downcase (or (quri:uri-scheme uri) "")))
+         (secure   (cond ((string= scheme "wss") t)
+                         ((string= scheme "ws")  nil)
+                         (t
+                          (error 'handshake-url-error
+                                 :url url
+                                 :reason (format nil "Unsupported scheme ~S in ~S (expected \"ws\" or \"wss\")"
+                                                 scheme url)))))
+         (raw-host (or (quri:uri-host uri)
+                       (error 'handshake-url-error
+                              :url url
+                              :reason (format nil "Missing host in URL ~S" url))))
+         ;; quri keeps brackets on IPv6 literals; most socket / SNI APIs want them stripped
+         (host     (if (and (stringp raw-host)
+                            (> (length raw-host) 1)
+                            (char= (char raw-host 0) #\[)
+                            (char= (char raw-host (1- (length raw-host))) #\]))
+                       (subseq raw-host 1 (1- (length raw-host)))
+                       raw-host))
+         (port     (or (quri:uri-port uri)
+                       (if secure 443 80)))
+         (path     (let ((p (or (quri:uri-path uri) "/"))
+                         (q (quri:uri-query uri)))
+                     (if q
+                         (concatenate 'string p "?" q)
+                         p)))
+         (fragment (quri:uri-fragment uri)))
+    ;; RFC 6455 / common practice: fragment is meaningless and should be rejected
+    (when fragment
+      (error 'handshake-url-error
+             :url url
+             :reason (format nil "Fragment identifier ~S is not allowed in WebSocket URL ~S"
+                             fragment url)))
+    ;; Detect conflicting :secure supplied by the caller
+    (let ((provided (getf args :secure 'missing)))
+      (unless (eq provided 'missing)
+        (let ((provided-bool (and provided t))) ; any non-nil → t
+          (unless (eq provided-bool secure)
+            (error 'handshake-url-error
+                   :url url
+                   :reason (format nil ":secure ~S conflicts with scheme ~S (implies ~S)"
+                                   provided scheme secure))))))
+    ;; Strip :secure so the scheme-derived value always wins cleanly
+    ;; (avoids duplicate-keyword subtleties and silent overriding)
+    (let ((clean-args
+           (loop for (k v) on args by #'cddr
+                 unless (eq k :secure)
+                 collect k and collect v)))
+      (apply #'connect host port path
+             :secure secure
+             clean-args))))
 
 (defun %try-finalize-close (conn &optional (code 1006))
   (bt:with-lock-held ((conn-lock conn))
@@ -372,6 +405,8 @@
 
 
 (defun utf8-truncate (string max-bytes)
+  (declare (type string string)
+           (type integer max-bytes))
   (let ((byte-len 0)
         (end 0))
     (loop for i from 0 below (length string)
@@ -387,6 +422,8 @@
     (subseq string 0 end)))
 
 (defun close-connection (conn &optional (code 1000) (reason ""))
+  (declare (type integer code)
+           (type string reason))
   (bt:with-lock-held ((conn-lock conn))
     (when (eq (conn-state conn) :open)
       (unless (valid-close-status-p code)
@@ -405,9 +442,6 @@
         (arm-close-timeout conn)))))
 
 (defun wait-until-closed (conn &optional (timeout nil))
-  "Block until the connection reaches :CLOSED.
-   TIMEOUT is in seconds (NIL = wait forever).  Returns T on success,
-   NIL on timeout."
   (bt:with-lock-held ((conn-lock conn))
     (loop
       (when (eq (conn-state conn) :closed)
