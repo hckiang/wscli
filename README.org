@@ -147,4 +147,7 @@ BSD 2-clause.
 
 ** Common Lisp Implementations
 
-The library is developed and tested on SBCL and Clozure CL.
+The library is known to work on SBCL, CCL and ECL.
+
+However, ECL’s execution/memory management model is ill‑suited to the library’s
+concurrent I/O performance; multiple streams or heavy loads are thus inadvisable on ECL.
