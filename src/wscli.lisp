@@ -484,7 +484,8 @@
   (let ((stream      (conn-stream conn))
         (handler     (conn-handler conn))
         (msg-opcode  nil)   ; 1 = text, 2 = binary, NIL = no message in progress
-        (msg-parts   nil))  ; list of payload vectors (newest first)
+        (msg-parts   nil)   ; list of payload vectors (newest first)
+        (rfc6455-close-reason ""))      ; This is the reason string in the protocol
     (labels ((deliver-message ()
                (let ((payload (concatenate-byte-vectors msg-parts)))
                  (if (= msg-opcode #x1)
@@ -495,17 +496,19 @@
                            (funcall handler :text text)
                            (setf msg-opcode nil
                                  msg-parts  nil))
-                       (babel-encodings:character-decoding-error ()
+                       (babel-encodings:character-decoding-error (e)
+                         (funcall handler :error e)
                          (close-connection conn 1007 "Invalid UTF-8")
-                         (finish-close 1007)))
+                         (finish-close 1007 "Invalid UTF-8")))
                      (progn
                        (funcall handler :binary payload)
                        (setf msg-opcode nil
                              msg-parts  nil)))))
-             (finish-close (code)
+             (finish-close (code &optional (reason ""))
                ;; Just force the state machine and leave the loop.
                ;; Resource cleanup + handler delivery happen in the
                ;; unwind-protect below.
+               (setf rfc6455-close-reason reason)
                (%try-finalize-close conn code)
                (return-from run-message-loop)))
       (unwind-protect
@@ -515,7 +518,7 @@
              (multiple-value-bind (opcode payload fin)
                  (handler-case (read-frame stream)
                    (end-of-file ()
-                     (finish-close 1006))
+                     (finish-close 1006 "End of file"))
                    (error (e)
                      (unless (conn-closed-p conn)
                        ;; This SSL warning can come from C and bubbles as a Lisp condition by cl+ssl
@@ -523,8 +526,9 @@
                        ;; if the connection is closing and we only warn about frame reading failure
                        ;; when the connection is in non-closing state.
                        (warn "Frame read error: ~A" e)
-                       (close-connection conn 1002 "Protocol error"))
-                     (finish-close 1002)))
+                       (funcall handler :error e)
+                       (close-connection conn 1002 ""))
+                     (finish-close 1002 "")))
                (handler-case 
                    (cond
                      ((member opcode '(#x8 #x9 #xA))
@@ -548,16 +552,20 @@
                               (when (plusp (length payload))
                                 (unless (valid-close-status-p code)
                                   (error 'invalid-close-code-error :received-code code)))
-                              (when (plusp (length reason-bytes))
-                                (handler-case
-                                    (babel:octets-to-string reason-bytes :encoding :utf-8 :errorp t)
-                                  (babel-encodings:character-decoding-error ()
-                                    (error 'invalid-utf8-error
-                                           :context :close-reason
-                                           :octets reason-bytes))))
-                              ;; Reply (or no-op if we already sent a Close) then finish.
-                              (close-connection conn (if (zerop (length payload)) 1000 code))
-                              (finish-close code)))))
+                              (if (plusp (length reason-bytes))
+                                (let ((received-reason-str
+                                        (handler-case
+                                            (babel:octets-to-string reason-bytes :encoding :utf-8 :errorp t)
+                                          (babel-encodings:character-decoding-error ()
+                                            (error 'invalid-utf8-error
+                                                   :context :close-reason
+                                                   :octets reason-bytes)))))
+                                  ;; Reply (or no-op if we already sent a Close) then finish.
+                                  (close-connection conn (if (zerop (length payload)) 1000 code))
+                                  (finish-close code received-reason-str))
+                                (progn
+                                  (close-connection conn (if (zerop (length payload)) 1000 code))
+                                  (finish-close code)))))))
                         (#x9
                          (ignore-errors (write-frame-locked conn #xA payload))
                          (funcall handler :ping payload))
@@ -581,8 +589,10 @@
                      (t
                       (error 'unknown-opcode-error :opcode opcode)))
                  (protocol-error (c)
+                   (funcall handler :error c)
                    (close-connection conn (protocol-error-close-code c) (protocol-error-message c))
-                   (finish-close (protocol-error-close-code c)))
+                   (finish-close (protocol-error-close-code c)
+                                 (protocol-error-message c)))
                  (error (e)
                    ;; If close-connection from other thread causes the state to flip from :open
                    ;; to :closing or :closed, sending of message might signal. In this case
@@ -590,10 +600,11 @@
                    ;; :open, it's an unexpected error that needs warning and we close the connection
                    ;; immediately.
                    (unless (conn-closed-p conn)
+                     (funcall handler :error e)
                      (warn "WebSocket listener error: ~A" e)
                      (ignore-errors
-                      (close-connection conn 1002 "Listener error")))
-                   (finish-close 1002)))))
+                      (close-connection conn 1002 "")))
+                   (finish-close 1002 "")))))
         (ignore-errors
          (if (conn-secure-p conn)
              (progn
@@ -605,5 +616,6 @@
             (if (conn-secure-p conn)
                 (close (conn-stream conn))
                 (socket-close (conn-socket conn))))|#
-        (funcall handler :close (conn-close-code conn))))))
+        (funcall handler :close (cons (conn-close-code conn)
+                                      rfc6455-close-reason))))))
 

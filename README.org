@@ -42,8 +42,9 @@ All other keyword arguments are passed through.
 **** Handler callback
 
 The handler function receives two values:
-- Event type – a keyword: ~:text~, ~:binary~, ~:ping~, ~:pong~, or ~:close~.
-- Payload – a string for ~:text~, a ~(simple-array (unsigned-byte 8))~ for ~:binary~, ~:ping~, or ~:pong~, and the close code for ~:close~.
+- Event type – a keyword: ~:text~, ~:binary~, ~:ping~, ~:pong~, ~:error~, or ~:close~.
+- Payload – a string for ~:text~, a ~(simple-array (unsigned-byte 8))~ for ~:binary~, ~:ping~, or ~:pong~, a condition for ~:error~,
+  and ~(close-code . reason-string)~ for ~:close~.
 
 For example:
 
@@ -126,13 +127,14 @@ If the connection was created with ~:background nil~, call this function in your
 *** Handling different event types
 
 #+begin_src lisp
-(defun my-handler (type data)
-  (case type
-    (:text   (format t "Text: ~a~%" data))
-    (:binary (format t "Binary: ~a bytes~%" (length data)))
-    (:ping   (format t "Ping: ~a~%" data))
-    (:pong   (format t "Pong: ~a~%" data))
-    (:close  (format t "Closed with code ~d~%" data))))
+  (defun my-handler (type data)
+    (case type
+      (:text   (format t "Text: ~a~%" data))
+      (:binary (format t "Binary: ~a bytes~%" (length data)))
+      (:ping   (format t "Ping: ~a~%" data))
+      (:pong   (format t "Pong: ~a~%" data))
+      (:error  (format t "Socket about to close due to error ~a~%" data))
+      (:close  (format t "Closed with code ~d and reason ~a~%" (car data) (cdr data)))))
 #+end_src
 
 ** Thread‑safety
