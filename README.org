@@ -13,8 +13,8 @@ the client side. Among web socket clients on the market, Allergo's aserve client
 mature but it is not open source. ~wet-sprockets~ uses global variable and looks a bit incomplete.
 While fukamachi's popular ~websocket-driver~ contains a performant client that works excellently for
 most typical use, it is less designed with concurrency and robust long-running services in mind
-compared to ~wscli~. For example, ~wscli~ has provides better thread-safety for multiple threads
-writing to the same socket and some requests closing; ~wscli~ also does safer gentle shutdown
+compared to ~wscli~. For example, ~wscli~ provides better thread-safety for multiple threads
+writing to the same socket and some request closing; ~wscli~ also does safer gentle shutdown
 (the user's handler code can be in a foreign library doing any side-effects and we should wait
 for it to finish).
 

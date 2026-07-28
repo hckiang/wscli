@@ -1,23 +1,23 @@
 (in-package :wscli)
 
 (define-condition websocket-error (error)
-  ((message :initarg :message :reader websocket-error-message))
+  ((message :initarg :message :initform "" :reader websocket-error-message))
   (:report (lambda (c s) (format s "WebSocket error: ~A" (websocket-error-message c)))))
 
 (define-condition invalid-command-error (websocket-error)
-  ((message :initarg :message :reader handshake-error-message))
+  ((message :initarg :message :initform "" :reader handshake-error-message))
   (:report (lambda (c s)
              (format s "WebSocket invalid command error: ~A"
                      (handshake-error-message c)))))
 
 (define-condition handshake-error (websocket-error)
-  ((message :initarg :message :reader handshake-error-message))
+  ((message :initarg :message :initform "" :reader handshake-error-message))
   (:report (lambda (c s)
              (format s "WebSocket handshake error: ~A"
                      (handshake-error-message c)))))
 
 (define-condition protocol-error (websocket-error)
-  ((message    :initarg :message    :reader protocol-error-message)
+  ((message    :initarg :message    :initform "" :reader protocol-error-message)
    (close-code :initarg :close-code :reader protocol-error-close-code :initform 1002)
    (opcode     :initarg :opcode     :reader protocol-error-opcode     :initform nil))
   (:report (lambda (c s)
