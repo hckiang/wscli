@@ -76,7 +76,7 @@ Send a binary frame. Octets must be a ~(unsigned-byte 8)~ array.
 **** ~send-ping~ conn &optional payload
 
 Send a ping control frame. Payload ≤ 125 bytes.  
-The listener automatically replies with a pong; the user handler receives a ~:pong~ event.
+The listener automatically replies with a pong.
 
 **** ~run-message-loop~ conn
 
@@ -131,8 +131,8 @@ If the connection was created with ~:background nil~, call this function in your
     (case type
       (:text   (format t "Text: ~a~%" data))
       (:binary (format t "Binary: ~a bytes~%" (length data)))
-      (:ping   (format t "Ping: ~a~%" data))
-      (:pong   (format t "Pong: ~a~%" data))
+      (:ping   (format t "Received a ping from remote: ~a~%" data))
+      (:pong   (format t "Received a pong from remote: ~a~%" data))
       (:error  (format t "Socket about to close due to error ~a~%" data))
       (:close  (format t "Closed with code ~d and reason ~a~%" (car data) (cdr data)))))
 #+end_src
