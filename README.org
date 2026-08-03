@@ -24,7 +24,7 @@ for it to finish).
 
 ** API
 
-**** ~connect~ host port path &key handler background origin protocols secure verify hostname
+**** ~connect~ host port path &key handler background origin protocols secure verify hostname max-frame-size
 
 Establish a WebSocket connection. Returns the connection object.
 
@@ -37,6 +37,7 @@ Establish a WebSocket connection. Returns the connection object.
 - ~secure~ – ~t~ for WSS (TLS).
 - ~verify~ – passed to ~cl+ssl:make-ssl-client-stream~ (default ~nil~).
 - ~hostname~ – optional SNI hostname (defaults to ~host~).
+- ~max-frame-size~ – maximum size of a frame (defaults to 10 MiB).
 
 **** ~connect-url~ url &rest args
 

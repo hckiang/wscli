@@ -17,6 +17,7 @@
    #:conn-state
    #:conn-subprotocol
    #:conn-secure-p
+   #:conn-max-frame-size
    #:conn-listener-thread
    #:conn-lock
    #:conn-closed-cv
@@ -90,6 +91,9 @@
 
    #:unexpected-data-frame-error
    #:unexpected-data-frame-opcode
+
+   #:frame-too-large-error
+   #:frame-too-large-error-size
 
    #:unknown-opcode-error
    #:unknown-opcode-error-opcode

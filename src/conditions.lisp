@@ -176,6 +176,14 @@
              (format s "WebSocket protocol error: unexpected non-continuation frame (~D) during fragmented message"
                      (unexpected-data-frame-opcode c)))))
 
+(define-condition frame-too-large-error (protocol-error)
+  ((size :initarg :size :reader frame-too-large-error-size))
+  (:default-initargs :close-code 1009
+                     :message "Message too big")
+  (:report (lambda (c s)
+             (format s "WebSocket protocol error: the peer advertised too large (~D bytes) a frame" 
+                     (frame-too-large-error-size c)))))
+
 (define-condition unknown-opcode-error (protocol-error)
   ((opcode :initarg :opcode :reader unknown-opcode-error-opcode))
   (:default-initargs :close-code 1002

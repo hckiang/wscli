@@ -75,6 +75,9 @@
    (state        :initform :open        :accessor conn-state) ; :open | :closing | :closed
    (subprotocol  :initform nil          :accessor conn-subprotocol)
    (secure-p     :initform nil          :accessor conn-secure-p)
+   (max-frame-size :initarg :max-frame-size
+                   :initform (* 100 1024 1024)
+                   :accessor conn-max-frame-size)
    (listener-thread :initform nil :accessor conn-listener-thread)
    (lock         :initform (bt:make-recursive-lock "ws-lock")
                  :accessor conn-lock)
@@ -247,8 +250,7 @@
         (error 'connection-closed-error)))
     (write-frame (conn-stream conn) opcode payload :fin fin :mask mask)))
 
-
-(defun read-frame (stream)
+(defun read-frame (stream max-frame-size)
   (let* ((b0 (read-byte stream))
          (b1 (read-byte stream))
          (fin (logbitp 7 b0))
@@ -282,7 +284,9 @@
              (error 'non-minimal-payload-length-error
                     :actual-length extended
                     :declared-length 127))
-           (setf len extended)))))
+           (setf len extended))))
+      ((>= len max-frame-size)
+       (error 'frame-too-large-error :size len)))
     (let ((data (read-exact stream len)))
       (values opcode data fin))))
 
@@ -293,7 +297,8 @@
                   (protocols nil)
                   (secure nil)
                   (verify :required)
-                  (hostname nil)) ; SNI hostname (defaults to HOST)
+                  (hostname nil)
+                  (max-frame-size (* 100 1024 1024))) ; SNI hostname (defaults to HOST)
   (let* ((socket (socket-connect host port
                                  :element-type '(unsigned-byte 8)))
          (raw-stream (socket-stream socket))
@@ -320,7 +325,8 @@
          (conn (make-instance 'websocket-connection
                               :socket socket
                               :stream stream
-                              :handler handler)))
+                              :handler handler
+                              :max-frame-size max-frame-size)))
     (setf (conn-subprotocol conn) proto
           (conn-secure-p conn) secure)
     (when background
@@ -486,6 +492,7 @@
 (defun run-message-loop (conn)
   (let ((stream      (conn-stream conn))
         (handler     (conn-handler conn))
+        (max-frame-size (conn-max-frame-size conn))
         (msg-opcode  nil)   ; 1 = text, 2 = binary, NIL = no message in progress
         (msg-parts   nil))
     (labels ((deliver-message ()
@@ -518,9 +525,14 @@
                (when (eq (conn-state conn) :closed)
                  (return)))
              (multiple-value-bind (opcode payload fin)
-                 (handler-case (read-frame stream)
+                 (handler-case (read-frame stream max-frame-size)
                    (end-of-file ()
                      (finish-close 1006 "End of file"))
+                   (frame-too-large-error (c)
+                     (funcall handler :error c)
+                     (close-connection conn (protocol-error-close-code c) (protocol-error-message c))
+                     (finish-close (protocol-error-close-code c)
+                                   (protocol-error-message c)))
                    (error (e)
                      (unless (conn-closed-p conn)
                        ;; This SSL warning can come from C and bubbles as a Lisp condition by cl+ssl
@@ -537,7 +549,7 @@
                       (unless fin
                         (error 'fragmented-control-frame-error))
                       (unless (<= (length payload) 125)
-                        (error 'control-frame-too-large-error))
+                        (error 'control-frame-too-large-error :size (length payload)))
                       (case opcode
                         (#x8
                          (cond
