@@ -114,7 +114,13 @@
                      (every #'digit-char-p code-str))
             (values version (parse-integer code-str) reason)))))))
 
-(defun perform-handshake (stream host path &key (origin nil) (protocols nil) (port 80) (secure nil))
+(defun perform-handshake (stream host path
+                          &key
+                            (origin nil)
+                            (protocols nil)
+                            (port 80)
+                            (secure nil)
+                            (extra-headers nil))
   (let* ((key (make-websocket-key))
          (accept (accept-key key))
          (host-header
@@ -134,6 +140,9 @@
     (when protocols
       (write-ascii-line stream
                         (format nil "Sec-WebSocket-Protocol: ~{~A~^, ~}" protocols)))
+    (dolist (hdr extra-headers)
+      (destructuring-bind (name . value) hdr
+        (write-ascii-line stream (format nil "~A: ~A" name value))))
     (write-crlf stream)                 ; empty line
     (finish-output stream)
     ;; Status line
@@ -297,8 +306,9 @@
                   (protocols nil)
                   (secure nil)
                   (verify :required)
-                  (hostname nil)
-                  (max-frame-size (* 100 1024 1024))) ; SNI hostname (defaults to HOST)
+                  (hostname nil) ; SNI hostname (defaults to HOST)
+                  (max-frame-size (* 100 1024 1024))
+                  (extra-headers nil))
   (let* ((socket (socket-connect host port
                                  :element-type '(unsigned-byte 8)))
          (raw-stream (socket-stream socket))
@@ -321,7 +331,8 @@
                      raw-stream))
          (proto (perform-handshake stream host path
                                    :origin origin
-                                   :protocols protocols))
+                                   :protocols protocols
+                                   :extra-headers extra-headers))
          (conn (make-instance 'websocket-connection
                               :socket socket
                               :stream stream

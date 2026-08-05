@@ -24,7 +24,7 @@ for it to finish).
 
 ** API
 
-**** ~connect~ host port path &key handler background origin protocols secure verify hostname max-frame-size
+**** ~connect~ host port path &key handler background origin protocols secure verify hostname max-frame-size extra-headers
 
 Establish a WebSocket connection. Returns the connection object.
 
@@ -38,7 +38,8 @@ Establish a WebSocket connection. Returns the connection object.
 - ~verify~ – passed to ~cl+ssl:make-ssl-client-stream~ (default ~nil~).
 - ~hostname~ – optional SNI hostname (defaults to ~host~).
 - ~max-frame-size~ – maximum size of a frame (defaults to 10 MiB).
-
+- ~extra-headers~ - An alist of HTTP headers to send during initial HTTP request; for example ~`(("Authorization" . ,api-key))~.
+  
 **** ~connect-url~ url &rest args
 
 Parses ~ws://...~ or ~wss://...~ URLs and calls ~connect~.  
