@@ -30,13 +30,13 @@
 ;; ------------
 
 (define-condition max-frame-size-too-big-error (invalid-command-error)
-  ((n :initarg n :reader max-frame-size-too-big-error-n))
+  ((n :initarg :n :reader max-frame-size-too-big-error-n))
   (:report (lambda (c s)
              (format s "The parameter max-frame-size is ~D, doesn't fit in a fixnum.)"
                      (max-frame-size-too-big-error-n c)))))
 
 (define-condition ping-payload-too-big-error (invalid-command-error)
-  ((n-bytes :initarg n-bytes :reader ping-payload-too-big-error-n-bytes))
+  ((n-bytes :initarg :n-bytes :reader ping-payload-too-big-error-n-bytes))
   (:report (lambda (c s)
              (format s "Ping payload too big (at most 125 bytes, but wanted to send ~D bytes)"
                      (ping-payload-too-big-error-n-bytes c)))))
