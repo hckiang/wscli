@@ -17,35 +17,54 @@
     (cl-base64:usb8-array-to-base64-string digest)))
 
 (defun mask-payload (payload mask)
+  (declare (type (simple-array (unsigned-byte 8) (*)) payload mask)
+           (optimize (speed 3) (safety 0) (debug 0)))
   (let* ((len (length payload))
          (result (make-array len :element-type '(unsigned-byte 8))))
+    (declare (type fixnum len)
+             (type (simple-array (unsigned-byte 8) (*)) result))
     (dotimes (i len)
+      (declare (type fixnum i))
       (setf (aref result i)
             (logxor (aref payload i) (aref mask (mod i 4)))))
     result))
 
 (defun read-exact (stream n)
+  (declare (type stream stream)
+           (type (unsigned-byte 63) n)
+           (optimize (speed 3) (safety 1)))
   (let ((buf (make-array n :element-type '(unsigned-byte 8)))
         (start 0))
+    (declare (type (simple-array (unsigned-byte 8) (*)) buf)
+             (type fixnum start))
     (loop
       (when (= start n) (return buf))
       (let ((count (read-sequence buf stream :start start :end n)))
+        (declare (type fixnum count))
         (when (zerop count)
           (error 'end-of-file :stream stream))
         (incf start count)))))
 
 (defun write-crlf (stream)
+  (declare (type stream stream)
+           (optimize (speed 3) (safety 1)))
   (write-byte #x0d stream)
   (write-byte #x0a stream))
 
 (defun write-ascii-line (stream string)
+  (declare (type stream stream)
+           (type simple-string string)
+           (optimize (speed 3) (safety 1)))
   (loop for c across string
         do (write-byte (char-code c) stream))
   (write-crlf stream))
 
 (defun read-ascii-line (stream)
+  (declare (type stream stream)
+           (optimize (speed 3) (safety 1)))
   (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
                              :adjustable t :fill-pointer 0)))
+    (declare (type (array (unsigned-byte 8) (*)) bytes))
     (loop
       (let ((b (read-byte stream nil nil)))
         (cond
@@ -77,7 +96,8 @@
    (secure-p     :initform nil          :accessor conn-secure-p)
    (max-frame-size :initarg :max-frame-size
                    :initform (* 100 1024 1024)
-                   :accessor conn-max-frame-size)
+                   :accessor conn-max-frame-size
+                   :type (integer 0 #.most-positive-fixnum))
    (listener-thread :initform nil :accessor conn-listener-thread)
    (lock         :initform (bt:make-recursive-lock "ws-lock")
                  :accessor conn-lock)
@@ -89,7 +109,8 @@
    (close-reason :initform "" :accessor conn-close-reason)))
 
 (defun conn-closed-p (conn)
-  (declare (type websocket-connection conn))
+  (declare (type websocket-connection conn)
+           (optimize (speed 3) (safety 1)))
   (bt:with-recursive-lock-held ((conn-lock conn))
     (not (eq (conn-state conn) :open))))
 
@@ -100,7 +121,7 @@
       (<= 3000 code 4999)))
 
 (defun parse-http-status-line (line)
-  (declare (type string line))
+  (declare (type (or null simple-string) line))
   (when (and line (>= (length line) 12)) ; "HTTP/1.x YYY" because §4.1: "... HTTP version MUST be at least 1.1."
     (let* ((sp1 (position #\Space line))
            (sp2 (and sp1 (position #\Space line :start (1+ sp1)))))
@@ -259,45 +280,68 @@
         (error 'connection-closed-error)))
     (write-frame (conn-stream conn) opcode payload :fin fin :mask mask)))
 
+
+
+(declaim (ftype (function (stream (integer 0 #.most-positive-fixnum))
+                          (values (unsigned-byte 4)
+                                  (simple-array (unsigned-byte 8) (*))
+                                  boolean))
+                read-frame))
 (defun read-frame (stream max-frame-size)
-  (let* ((b0 (read-byte stream))
-         (b1 (read-byte stream))
+  (declare (type stream stream)
+           (type (integer 0 #.most-positive-fixnum) max-frame-size)
+           (optimize (speed 3) (safety 1)))
+  (let* ((b0 (the (unsigned-byte 8) (read-byte stream)))
+         (b1 (the (unsigned-byte 8) (read-byte stream)))
          (fin (logbitp 7 b0))
-         (rsv (logand b0 #x70))         ; RSV1|RSV2|RSV3
+         (rsv (logand b0 #x70))
          (opcode (logand b0 #x0f))
          (masked (logbitp 7 b1))
          (len (logand b1 #x7f)))
+    (declare (type (unsigned-byte 8) b0 b1)
+             (type boolean fin masked)
+             (type (unsigned-byte 4) opcode)
+             (type (unsigned-byte 7) rsv)
+             (type (integer 0 127) len))
     (when (plusp rsv)
       (error 'reserved-bits-error :rsv-bits rsv))
     (when masked
       (error 'masked-frame-from-server-error))
-    (cond
-      ((= len 126)
-       (let ((extended (+ (ash (read-byte stream) 8)
-                          (read-byte stream))))
-         (when (< extended 126)
-           (error 'non-minimal-payload-length-error
-                  :actual-length extended
-                  :declared-length 126))
-         (setf len extended)))
-      ((= len 127)
-       (let ((lenbuf (read-exact stream 8)))
-         (let ((extended 0)
-               (first-byte (aref lenbuf 0)))
-           (dotimes (i 8)
-             (setf extended (+ (ash extended 8) (aref lenbuf i))))
-           ;; Most-significant bit of the 64-bit length MUST be 0
-           (when (logbitp 7 first-byte)
-             (error 'payload-msb-set-error))
-           (when (< extended 65536)
-             (error 'non-minimal-payload-length-error
-                    :actual-length extended
-                    :declared-length 127))
-           (setf len extended)))))
-    (when (>= len max-frame-size)
-      (error 'frame-too-large-error :size len))
-    (let ((data (read-exact stream len)))
-      (values opcode data fin))))
+    (let ((payload-len
+           (cond
+             ((= len 126)
+              (let ((extended (+ (ash (the (unsigned-byte 8) (read-byte stream)) 8)
+                                 (the (unsigned-byte 8) (read-byte stream)))))
+                (declare (type (unsigned-byte 16) extended))
+                (when (< extended 126)
+                  (error 'non-minimal-payload-length-error
+                         :actual-length extended
+                         :declared-length 126))
+                extended))
+             ((= len 127)
+              (let ((lenbuf (read-exact stream 8)))
+                (declare (type (simple-array (unsigned-byte 8) (8)) lenbuf))
+                (let ((extended 0)
+                      (first-byte (aref lenbuf 0)))
+                  (declare (type (unsigned-byte 64) extended)
+                           (type (unsigned-byte 8) first-byte))
+                  (dotimes (i 8)
+                    (declare (type fixnum i))
+                    (setf extended (+ (ash extended 8) (aref lenbuf i))))
+                  (when (logbitp 7 first-byte)
+                    (error 'payload-msb-set-error))
+                  (when (< extended 65536)
+                    (error 'non-minimal-payload-length-error
+                           :actual-length extended
+                           :declared-length 127))
+                  extended)))
+             (t len))))
+      (declare (type (integer 0 *) payload-len))
+      (when (>= payload-len max-frame-size)
+        (error 'frame-too-large-error :size payload-len))
+      (let ((data (read-exact stream payload-len)))
+        (values opcode data fin)))))
+
 
 (defun connect (host port path
                 &key (handler (lambda (type data) (declare (ignore type data))))
@@ -306,47 +350,52 @@
                   (protocols nil)
                   (secure nil)
                   (verify :required)
-                  (hostname nil) ; SNI hostname (defaults to HOST)
+                  (hostname nil)     ; SNI hostname (defaults to HOST)
                   (max-frame-size (* 100 1024 1024))
                   (extra-headers nil))
-  (let* ((socket (socket-connect host port
-                                 :element-type '(unsigned-byte 8)))
-         (raw-stream (socket-stream socket))
-         (stream (if secure
-                     (cl+ssl:make-ssl-client-stream
-                      raw-stream
-                      :hostname (or hostname host)
-                      ;; :unwrap-stream-p t is supposedly more direct and faster, but it causes
-                      ;; FreeBSD Clozure CL to fail with corrupt memory inside the SSL library
-                      ;; for unknown reasons, especially under heavy load.
-                      ;;
-                      ;; Interestingly, fukamachi's websocket-driver fails the exact same way
-                      ;; on the same machine (they use :unwrap-stream-p t), so I believe this is
-                      ;; not a wscli bug per-se. For safety reasons, we use Lisp stream here.
-                      ;;
-                      ;; With Lisp streams, I haven't seen any memory corruptions under very heavy
-                      ;; load across multiple machines and both SBCL and CCL.
-                      :unwrap-stream-p nil
-                      :verify (or verify nil))
-                     raw-stream))
-         (proto (perform-handshake stream host path
-                                   :origin origin
-                                   :protocols protocols
-                                   :extra-headers extra-headers))
-         (conn (make-instance 'websocket-connection
-                              :socket socket
-                              :stream stream
-                              :handler handler
-                              :max-frame-size max-frame-size)))
-    (setf (conn-subprotocol conn) proto
-          (conn-secure-p conn) secure)
-    (when background
-      (setf (conn-listener-thread conn)
-            (bt:make-thread
-             (lambda ()
-               (run-message-loop conn))
-             :name (format nil "ws-listener-~A:~A" host port))))
-    conn))
+  (declare (type (integer 0 *) max-frame-size))
+  (when (> max-frame-size #.most-positive-fixnum)
+    (error 'max-frame-size-too-big-error :n max-frame-size))
+  (locally
+      (declare (type (integer 0 #.most-positive-fixnum) max-frame-size))
+    (let* ((socket (socket-connect host port
+                                   :element-type '(unsigned-byte 8)))
+           (raw-stream (socket-stream socket))
+           (stream (if secure
+                       (cl+ssl:make-ssl-client-stream
+                        raw-stream
+                        :hostname (or hostname host)
+                        ;; :unwrap-stream-p t is supposedly more direct and faster, but it causes
+                        ;; FreeBSD Clozure CL to fail with corrupt memory inside the SSL library
+                        ;; for unknown reasons, especially under heavy load.
+                        ;;
+                        ;; Interestingly, fukamachi's websocket-driver fails the exact same way
+                        ;; on the same machine (they use :unwrap-stream-p t), so I believe this is
+                        ;; not a wscli bug per-se. For safety reasons, we use Lisp stream here.
+                        ;;
+                        ;; With Lisp streams, I haven't seen any memory corruptions under very heavy
+                        ;; load across multiple machines and both SBCL and CCL.
+                        :unwrap-stream-p nil
+                        :verify (or verify nil))
+                       raw-stream))
+           (proto (perform-handshake stream host path
+                                     :origin origin
+                                     :protocols protocols
+                                     :extra-headers extra-headers))
+           (conn (make-instance 'websocket-connection
+                                :socket socket
+                                :stream stream
+                                :handler handler
+                                :max-frame-size max-frame-size)))
+      (setf (conn-subprotocol conn) proto
+            (conn-secure-p conn) secure)
+      (when background
+        (setf (conn-listener-thread conn)
+              (bt:make-thread
+               (lambda ()
+                 (run-message-loop conn))
+               :name (format nil "ws-listener-~A:~A" host port))))
+      conn)))
 
 (defun connect-url (url &rest args &key &allow-other-keys)
   (declare (type string url))
@@ -473,41 +522,52 @@
         (return nil)))))
 
 (defun send-text (conn text)
+  (declare (type websocket-connection conn)
+           (type string text)
+           (optimize (speed 3) (safety 1)))
   (when (conn-closed-p conn)
     (error 'connection-closed-error))
   (write-frame-locked conn #x1
                       (babel:string-to-octets text :encoding :utf-8)))
 
 (defun send-binary (conn data)
+  (declare (type websocket-connection conn)
+           (type (array (unsigned-byte 8) (*)) data)
+           (optimize (speed 3) (safety 1)))
   (when (conn-closed-p conn)
     (error 'connection-closed-error))
   (write-frame-locked conn #x2 data))
 
-(defun send-ping (conn &optional (payload #()))
+(defun send-ping (conn
+                  &optional
+                    (payload #.(make-array 0 :element-type '(unsigned-byte 8))))
+  (declare (type websocket-connection conn)
+           (type (array (unsigned-byte 8) (*)) payload)
+           (optimize (speed 3) (safety 1)))
   (when (conn-closed-p conn)
     (error 'connection-closed-error))
   (when (> (length payload) 125)
     (error 'ping-payload-too-big-error :n-bytes (length payload)))
   (write-frame-locked conn #x9 payload))
 
-(defun concatenate-byte-vectors (parts)
-  (let* ((parts (nreverse parts))
-         (total (loop for p in parts sum (length p)))
-         (result (make-array total :element-type '(unsigned-byte 8)))
-         (pos 0))
-    (dolist (p parts)
-      (replace result p :start1 pos)
-      (incf pos (length p)))
-    result))
-
 (defun run-message-loop (conn)
+  (declare (type websocket-connection conn)
+           (optimize (speed 3) (safety 1)))
   (let ((stream      (conn-stream conn))
         (handler     (conn-handler conn))
         (max-frame-size (conn-max-frame-size conn))
         (msg-opcode  nil)   ; 1 = text, 2 = binary, NIL = no message in progress
         (msg-buffer  nil)   ; adjustable (unsigned-byte 8) vector or NIL
         (msg-len     0))
+    (declare (type stream stream)
+             (type function handler)
+             (type (integer 0 #.most-positive-fixnum) max-frame-size)
+             (type (or null (unsigned-byte 4)) msg-opcode)
+             (type (or null (array (unsigned-byte 8) (*))) msg-buffer)
+             (type fixnum msg-len))
     (labels ((deliver-payload (opcode payload)
+               (declare (type (unsigned-byte 4) opcode)
+                        (type (array (unsigned-byte 8) (*)) payload))
                (if (= opcode #x1)
                    (handler-case
                        (let ((text (babel:octets-to-string payload :encoding :utf-8 :errorp t)))
@@ -521,14 +581,14 @@
                (let ((payload (if (zerop msg-len)
                                   (make-array 0 :element-type '(unsigned-byte 8))
                                   (subseq msg-buffer 0 msg-len))))
+                 (declare (type (simple-array (unsigned-byte 8) (*)) payload))
                  (deliver-payload msg-opcode payload)
                  (setf msg-opcode nil
                        msg-buffer nil
                        msg-len    0)))
              (finish-close (code &optional (reason ""))
-               ;; Just force the state machine and leave the loop.
-               ;; Resource cleanup + handler delivery happen in the
-               ;; unwind-protect below.
+               (declare (type (integer 0 *) code)
+                        (type string reason))
                (%try-finalize-close conn code reason)
                (return-from run-message-loop)))
       (unwind-protect
@@ -555,7 +615,11 @@
                        (funcall handler :error e)
                        (close-connection conn 1002 ""))
                      (finish-close 1002 "")))
+               (declare (type (unsigned-byte 4) opcode)
+                        (type (simple-array (unsigned-byte 8) (*)) payload)
+                        (type boolean fin))
                (let ((len-payload (length payload)))
+                 (declare (type fixnum len-payload))
                  (handler-case 
                      (cond
                        ((member opcode '(#x8 #x9 #xA))
@@ -575,7 +639,9 @@
                                                   (aref payload 1))))
                                      (reason-bytes (if (> len-payload 2)
                                                        (subseq payload 2)
-                                                       #())))
+                                                       (make-array 0 :element-type '(unsigned-byte 8)))))
+                                (declare (type (integer 0 65535) code)
+                                         (type (array (unsigned-byte 8) (*)) reason-bytes))
                                 (when (plusp len-payload)
                                   (unless (valid-close-status-p code)
                                     (error 'invalid-close-code-error :received-code code)))
@@ -587,6 +653,7 @@
                                                 (error 'invalid-utf8-error
                                                        :context :close-reason
                                                        :octets reason-bytes)))))
+                                      (declare (type string received-reason-str))
                                       ;; Reply (or no-op if we already sent a Close) then finish.
                                       (close-connection conn (if (zerop len-payload) 1000 code))
                                       (finish-close code received-reason-str))
@@ -609,27 +676,27 @@
                                (let ((len len-payload))
                                  (setf msg-opcode opcode
                                        msg-buffer (make-array (max len 16)
-                                                              :element-type '(unsigned-byte 8)
-                                                              :adjustable t
-                                                              :fill-pointer 0)
+                                                              :element-type '(unsigned-byte 8))
                                        msg-len 0)
                                  (when (plusp len)
                                    (replace msg-buffer payload)
-                                   (setf msg-len len
-                                         (fill-pointer msg-buffer) len)))))
+                                   (setf msg-len len)))))
                           (t
                            (unless (= opcode #x0)
                              (error 'unexpected-data-frame-error :received-opcode opcode))
-                           (let ((need (+ msg-len len-payload))
-                                 (dim  (array-dimension msg-buffer 0)))
-                             (when (> need dim)
-                               (adjust-array msg-buffer
-                                             (max need (* 2 dim))
-                                             :fill-pointer msg-len))
-                             (when (plusp len-payload)
-                               (replace msg-buffer payload :start1 msg-len)
-                               (incf msg-len len-payload)
-                               (setf (fill-pointer msg-buffer) msg-len)))
+                           (locally
+                               (declare (type (simple-array (unsigned-byte 8) (*)) msg-buffer))
+                             (let ((need (+ msg-len len-payload))
+                                   (dim  (array-dimension msg-buffer 0)))
+                               (declare (type fixnum need dim))
+                               (when (> need dim)
+                                 (let ((new (make-array (max need (* 2 dim))
+                                                        :element-type '(unsigned-byte 8))))
+                                   (replace new msg-buffer :end1 msg-len)
+                                   (setf msg-buffer new)))
+                               (when (plusp len-payload)
+                                 (replace msg-buffer payload :start1 msg-len)
+                                 (incf msg-len len-payload))))
                            (when fin
                              (deliver-message)))))
                        (t
