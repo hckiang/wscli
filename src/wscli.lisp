@@ -1,5 +1,3 @@
-;;;; RFC 6455 WebSocket client
-
 (in-package :wscli)
 
 (defun make-websocket-key ()
@@ -33,6 +31,7 @@
   (declare (type stream stream)
            (type (unsigned-byte 63) n)
            (optimize (speed 3) (safety 1)))
+  ;; [GC KILLER]: Shouldn't.
   (let ((buf (make-array n :element-type '(unsigned-byte 8)))
         (start 0))
     (declare (type (simple-array (unsigned-byte 8) (*)) buf)
@@ -53,7 +52,7 @@
 
 (defun write-ascii-line (stream string)
   (declare (type stream stream)
-           (type simple-string string)
+           (type string string)
            (optimize (speed 3) (safety 1)))
   (loop for c across string
         do (write-byte (char-code c) stream))
@@ -98,6 +97,9 @@
                    :initform (* 100 1024 1024)
                    :accessor conn-max-frame-size
                    :type (integer 0 #.most-positive-fixnum))
+   (reuse-text-message-strbuf :initarg :reuse-text-message-strbuf
+                              :initform nil
+                              :accessor reuse-text-message-strbuf)
    (listener-thread :initform nil :accessor conn-listener-thread)
    (lock         :initform (bt:make-recursive-lock "ws-lock")
                  :accessor conn-lock)
@@ -352,7 +354,8 @@
                   (verify :required)
                   (hostname nil)     ; SNI hostname (defaults to HOST)
                   (max-frame-size (* 100 1024 1024))
-                  (extra-headers nil))
+                  (extra-headers nil)
+                  (reuse-text-message-strbuf nil))
   (declare (type (integer 0 *) max-frame-size))
   (when (> max-frame-size #.most-positive-fixnum)
     (error 'max-frame-size-too-big-error :n max-frame-size))
@@ -386,7 +389,8 @@
                                 :socket socket
                                 :stream stream
                                 :handler handler
-                                :max-frame-size max-frame-size)))
+                                :max-frame-size max-frame-size
+                                :reuse-text-message-strbuf reuse-text-message-strbuf)))
       (setf (conn-subprotocol conn) proto
             (conn-secure-p conn) secure)
       (when background
@@ -550,6 +554,43 @@
     (error 'ping-payload-too-big-error :n-bytes (length payload)))
   (write-frame-locked conn #x9 payload))
 
+(defun %ensure-char-buffer (buffer needed)
+  (declare (type (or null string) buffer)
+           (type (integer 0 #.most-positive-fixnum) needed)
+           (optimize (speed 3) (safety 1)))
+  (cond ((null buffer)
+         (make-array (max needed 4096)
+                     :element-type 'character
+                     :fill-pointer 0
+                     :adjustable t))
+        ((>= (array-total-size buffer) needed)
+         buffer)
+        (t
+         (adjust-array buffer
+                       (max needed (the fixnum (* 2 (array-total-size buffer))))
+                       :fill-pointer (fill-pointer buffer)
+                       :adjustable t))))
+
+(defun %utf8-decode-borrowed (octets buffer &key (start 0) end)
+  (declare (type (array (unsigned-byte 8) (*)) octets)
+           (type (integer 0 *) start)
+           (type (or null (integer 0 *)) end)
+           (optimize (speed 3) (safety 1)))
+  (let* ((end    (or end (length octets)))
+         (needed (the fixnum (- end start)))
+         (buf    (%ensure-char-buffer buffer needed)))
+    (declare (type fixnum needed)
+             (type string buf))
+    ;; Assumes utf8-decode-into returns the absolute end index in DEST
+    ;; (i.e. one past the last character written).  Adjust the SETF if
+    ;; your implementation returns a character count instead.
+    (let ((new-end (reckless-utf8:utf8-decode-into octets buf
+                                                   :start start
+                                                   :end end
+                                                   :dest-start 0)))
+      (setf (fill-pointer buf) new-end)
+      buf)))
+
 (defun run-message-loop (conn)
   (declare (type websocket-connection conn)
            (optimize (speed 3) (safety 1)))
@@ -558,7 +599,13 @@
         (max-frame-size (conn-max-frame-size conn))
         (msg-opcode  nil)   ; 1 = text, 2 = binary, NIL = no message in progress
         (msg-buffer  nil)   ; adjustable (unsigned-byte 8) vector or NIL
-        (msg-len     0))
+        (msg-len     0)
+        (text-buf    (if (reuse-text-message-strbuf conn)
+                         (make-array 4096
+                                     :element-type 'character
+                                     :fill-pointer 0
+                                     :adjustable t)
+                         nil)))
     (declare (type stream stream)
              (type function handler)
              (type (integer 0 #.most-positive-fixnum) max-frame-size)
@@ -569,13 +616,25 @@
                (declare (type (unsigned-byte 4) opcode)
                         (type (array (unsigned-byte 8) (*)) payload))
                (if (= opcode #x1)
-                   (handler-case
-                       (let ((text (babel:octets-to-string payload :encoding :utf-8 :errorp t)))
-                         (funcall handler :text text))
-                     (babel-encodings:character-decoding-error (e)
-                       (funcall handler :error e)
-                       (close-connection conn 1007 "Invalid UTF-8")
-                       (finish-close 1007 "Invalid UTF-8")))
+                   
+                   (if (reuse-text-message-strbuf conn)
+                       (handler-case
+                           (progn
+                             (setf text-buf (%utf8-decode-borrowed payload text-buf))
+                             (funcall handler :text text-buf))
+                         (reckless-utf8:utf8-decoding-error (e)
+                           (funcall handler :error e)
+                           (close-connection conn 1007 "Invalid UTF-8")
+                           (finish-close 1007 "Invalid UTF-8")))
+                       (handler-case
+                           ;; [GC KILLER] 7% of all garbage in my system; they are passed around
+                           ;; and may go into the older generations. Real GC problem!
+                           (let ((text (babel:octets-to-string payload :encoding :utf-8 :errorp t)))
+                             (funcall handler :text text))
+                         (babel-encodings:character-decoding-error (e)
+                           (funcall handler :error e)
+                           (close-connection conn 1007 "Invalid UTF-8")
+                           (finish-close 1007 "Invalid UTF-8"))))
                    (funcall handler :binary payload)))
              (deliver-message ()
                (let ((payload (if (zerop msg-len)
@@ -647,13 +706,29 @@
                                     (error 'invalid-close-code-error :received-code code)))
                                 (if (plusp (length reason-bytes))
                                     (let ((received-reason-str
-                                            (handler-case
-                                                (babel:octets-to-string reason-bytes :encoding :utf-8 :errorp t)
-                                              (babel-encodings:character-decoding-error ()
-                                                (error 'invalid-utf8-error
-                                                       :context :close-reason
-                                                       :octets reason-bytes)))))
+                                            (if (reuse-text-message-strbuf conn)
+                                                (handler-case
+                                                    (let ((maybe-same-buf
+                                                            (%utf8-decode-borrowed reason-bytes text-buf)))
+                                                      (setf text-buf maybe-same-buf)
+                                                      text-buf)
+                                                  (reckless-utf8:utf8-decoding-error ()
+                                                    (error 'invalid-utf8-error
+                                                           :context :close-reason
+                                                           :octets reason-bytes)))
+                                                (handler-case
+                                                    (babel:octets-to-string reason-bytes
+                                                                            :encoding :utf-8
+                                                                            :errorp t)
+                                                  (babel-encodings:character-decoding-error ()
+                                                    (error 'invalid-utf8-error
+                                                           :context :close-reason
+                                                           :octets reason-bytes))))))
                                       (declare (type string received-reason-str))
+                                      ;; because finish-close / handler
+                                      ;; may outlive the next reuse of text-buf...
+                                      (when (reuse-text-message-strbuf conn)
+                                        (setf received-reason-str (copy-seq received-reason-str)))
                                       ;; Reply (or no-op if we already sent a Close) then finish.
                                       (close-connection conn (if (zerop len-payload) 1000 code))
                                       (finish-close code received-reason-str))

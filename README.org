@@ -24,7 +24,7 @@ for it to finish).
 
 ** API
 
-**** ~connect~ host port path &key handler background origin protocols secure verify hostname max-frame-size extra-headers
+**** ~connect~ host port path &key handler background origin protocols secure verify hostname max-frame-size extra-headers reuse-text-message-strbuf
 
 Establish a WebSocket connection. Returns the connection object.
 
@@ -39,6 +39,11 @@ Establish a WebSocket connection. Returns the connection object.
 - ~hostname~ – optional SNI hostname (defaults to ~host~).
 - ~max-frame-size~ – maximum size of a frame (defaults to 10 MiB).
 - ~extra-headers~ - An alist of HTTP headers to send during initial HTTP request; for example ~`(("Authorization" . ,api-key))~.
+- ~reuse-text-message-strbuf~ - boolean. If ~nil~, each time before calling the user's handler function, a fresh
+                                ~simple-string~ handed to the user, so the user can safely store the string. If
+                                ~t~, a reusable ~string~ with fill pointer is passed to the user to avoid GC
+                                pressure, but the user promises that he will not store that string because it
+                                will be overwritten when the next message arrives.
   
 **** ~connect-url~ url &rest args
 
