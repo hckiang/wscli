@@ -568,8 +568,7 @@
         (t
          (adjust-array buffer
                        (max needed (the fixnum (* 2 (array-total-size buffer))))
-                       :fill-pointer (fill-pointer buffer)
-                       :adjustable t))))
+                       :fill-pointer (fill-pointer buffer)))))
 
 (defun %utf8-decode-borrowed (octets buffer &key (start 0) end)
   (declare (type (array (unsigned-byte 8) (*)) octets)
