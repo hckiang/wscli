@@ -338,7 +338,7 @@
                            :declared-length 127))
                   extended)))
              (t len))))
-      (declare (type (integer 0 *) payload-len))
+      (declare (type (integer 0 #.most-positive-fixnum) payload-len))
       (when (>= payload-len max-frame-size)
         (error 'frame-too-large-error :size payload-len))
       (let ((data (read-exact stream payload-len)))
@@ -572,22 +572,19 @@
 
 (defun %utf8-decode-borrowed (octets buffer &key (start 0) end)
   (declare (type (array (unsigned-byte 8) (*)) octets)
-           (type (integer 0 *) start)
-           (type (or null (integer 0 *)) end)
+           (type (integer 0 #.most-positive-fixnum) start)
+           (type (or null (integer 0 #.most-positive-fixnum)) end)
            (optimize (speed 3) (safety 1)))
   (let* ((end    (or end (length octets)))
          (needed (the fixnum (- end start)))
          (buf    (%ensure-char-buffer buffer needed)))
     (declare (type fixnum needed)
              (type string buf))
-    ;; Assumes utf8-decode-into returns the absolute end index in DEST
-    ;; (i.e. one past the last character written).  Adjust the SETF if
-    ;; your implementation returns a character count instead.
-    (let ((new-end (reckless-utf8:utf8-decode-into octets buf
-                                                   :start start
-                                                   :end end
-                                                   :dest-start 0)))
-      (setf (fill-pointer buf) new-end)
+    (let ((n-written (reckless-utf8:utf8-decode-into octets buf
+                                                     :start start
+                                                     :end end
+                                                     :dest-start 0)))
+      (setf (fill-pointer buf) (+ 0 n-written))
       buf)))
 
 (defun run-message-loop (conn)
@@ -615,7 +612,6 @@
                (declare (type (unsigned-byte 4) opcode)
                         (type (array (unsigned-byte 8) (*)) payload))
                (if (= opcode #x1)
-                   
                    (if (reuse-text-message-strbuf conn)
                        (handler-case
                            (progn
@@ -626,8 +622,7 @@
                            (close-connection conn 1007 "Invalid UTF-8")
                            (finish-close 1007 "Invalid UTF-8")))
                        (handler-case
-                           ;; [GC KILLER] 7% of all garbage in my system; they are passed around
-                           ;; and may go into the older generations. Real GC problem!
+                           ;; ALLOCATES...
                            (let ((text (babel:octets-to-string payload :encoding :utf-8 :errorp t)))
                              (funcall handler :text text))
                          (babel-encodings:character-decoding-error (e)
@@ -638,7 +633,7 @@
              (deliver-message ()
                (let ((payload (if (zerop msg-len)
                                   (make-array 0 :element-type '(unsigned-byte 8))
-                                  (subseq msg-buffer 0 msg-len))))
+                                  (subseq msg-buffer 0 msg-len)))) ;ALLOCATES.
                  (declare (type (simple-array (unsigned-byte 8) (*)) payload))
                  (deliver-payload msg-opcode payload)
                  (setf msg-opcode nil
