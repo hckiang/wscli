@@ -15,7 +15,7 @@
     (cl-base64:usb8-array-to-base64-string digest)))
 
 (defun mask-payload (payload mask)
-  (declare (type (simple-array (unsigned-byte 8) (*)) payload mask)
+  (declare (type (array (unsigned-byte 8) (*)) payload mask)
            (optimize (speed 3) (safety 0) (debug 0)))
   (let* ((len (length payload))
          (result (make-array len :element-type '(unsigned-byte 8))))
@@ -27,15 +27,18 @@
             (logxor (aref payload i) (aref mask (mod i 4)))))
     result))
 
+(declaim (ftype (function (stream (integer 0 #.most-positive-fixnum))
+                          (simple-array (unsigned-byte 8) (*)))
+                read-exact))
 (defun read-exact (stream n)
   (declare (type stream stream)
-           (type (unsigned-byte 63) n)
+           (type (integer 0 #.most-positive-fixnum) n)
            (optimize (speed 3) (safety 1)))
   ;; [GC KILLER]: Shouldn't.
   (let ((buf (make-array n :element-type '(unsigned-byte 8)))
         (start 0))
     (declare (type (simple-array (unsigned-byte 8) (*)) buf)
-             (type fixnum start))
+             (type (integer 0 #.most-positive-fixnum) start))
     (loop
       (when (= start n) (return buf))
       (let ((count (read-sequence buf stream :start start :end n)))
@@ -123,7 +126,7 @@
       (<= 3000 code 4999)))
 
 (defun parse-http-status-line (line)
-  (declare (type (or null simple-string) line))
+  (declare (type (or null string) line))
   (when (and line (>= (length line) 12)) ; "HTTP/1.x YYY" because §4.1: "... HTTP version MUST be at least 1.1."
     (let* ((sp1 (position #\Space line))
            (sp2 (and sp1 (position #\Space line :start (1+ sp1)))))
@@ -314,7 +317,7 @@
              ((= len 126)
               (let ((extended (+ (ash (the (unsigned-byte 8) (read-byte stream)) 8)
                                  (the (unsigned-byte 8) (read-byte stream)))))
-                (declare (type (unsigned-byte 16) extended))
+                (declare (type (unsigned-byte 64) extended))
                 (when (< extended 126)
                   (error 'non-minimal-payload-length-error
                          :actual-length extended
@@ -328,7 +331,7 @@
                   (declare (type (unsigned-byte 64) extended)
                            (type (unsigned-byte 8) first-byte))
                   (dotimes (i 8)
-                    (declare (type fixnum i))
+                    (declare (type (integer 0 8) i))
                     (setf extended (+ (ash extended 8) (aref lenbuf i))))
                   (when (logbitp 7 first-byte)
                     (error 'payload-msb-set-error))
@@ -338,11 +341,15 @@
                            :declared-length 127))
                   extended)))
              (t len))))
-      (declare (type (integer 0 #.most-positive-fixnum) payload-len))
-      (when (>= payload-len max-frame-size)
-        (error 'frame-too-large-error :size payload-len))
-      (let ((data (read-exact stream payload-len)))
-        (values opcode data fin)))))
+      (declare (type (unsigned-byte 64) payload-len))
+      (when (> payload-len most-positive-fixnum)
+        (error 'frame-too-large-error :size (the integer payload-len)))
+      (locally
+          (declare (type (integer 0 #.most-positive-fixnum) payload-len))
+        (when (>= payload-len max-frame-size)
+          (error 'frame-too-large-error :size payload-len))
+        (let ((data (read-exact stream payload-len)))
+          (values opcode data fin))))))
 
 
 (defun connect (host port path
