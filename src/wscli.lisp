@@ -104,7 +104,7 @@
                               :initform nil
                               :accessor reuse-text-message-strbuf)
    (listener-thread :initform nil :accessor conn-listener-thread)
-   (lock         :initform (bt:make-recursive-lock "ws-lock")
+   (lock         :initform (bt:make-lock "ws-lock")
                  :accessor conn-lock)
    (closed-cv    :initform (bt:make-condition-variable)
                  :accessor conn-closed-cv)
@@ -113,10 +113,15 @@
    (close-code   :initform 1006 :accessor conn-close-code)
    (close-reason :initform "" :accessor conn-close-reason)))
 
+(defun %%conn-closed-p (conn)
+  (declare (type websocket-connection conn)
+           (optimize (speed 3) (safety 1)))
+  (not (eq (conn-state conn) :open)))
+
 (defun conn-closed-p (conn)
   (declare (type websocket-connection conn)
            (optimize (speed 3) (safety 1)))
-  (bt:with-recursive-lock-held ((conn-lock conn))
+  (bt:with-lock-held ((conn-lock conn))
     (not (eq (conn-state conn) :open))))
 
 (defun valid-close-status-p (code)
@@ -178,6 +183,7 @@
         (declare (ignore version reason))
         (unless (eql code 101)
           (error 'handshake-http-error :status-code code :response-line status))))
+
     ;; Headers
     (let ((got-accept nil)
           (got-upgrade nil)
@@ -276,15 +282,17 @@
     (write-sequence masked stream)
     (finish-output stream)))
 
-(defun write-frame-locked (conn opcode payload &key (fin t) (mask t))
-  (bt:with-recursive-lock-held ((conn-lock conn))
-    (let ((state (conn-state conn)))
+(defun %%write-frame-safely (conn opcode payload &key (fin t) (mask t))
+  (let ((state (conn-state conn)))
       ;; Allow control frames (8,9,A) even while closing.
       (unless (or (eq state :open)
                   (and (eq state :closing) (member opcode '(#x8 #x9 #xA))))
         (error 'connection-closed-error)))
-    (write-frame (conn-stream conn) opcode payload :fin fin :mask mask)))
+    (write-frame (conn-stream conn) opcode payload :fin fin :mask mask))
 
+(defun write-frame-safely (conn opcode payload &key (fin t) (mask t))
+  (bt:with-lock-held ((conn-lock conn))
+    (%%write-frame-safely conn opcode payload :fin fin :mask mask)))
 
 
 (declaim (ftype (function (stream (integer 0 #.most-positive-fixnum))
@@ -362,7 +370,8 @@
                   (hostname nil)     ; SNI hostname (defaults to HOST)
                   (max-frame-size (* 100 1024 1024))
                   (extra-headers nil)
-                  (reuse-text-message-strbuf nil))
+                  (reuse-text-message-strbuf nil)
+                  (unwrap-stream-p t))
   (declare (type (integer 0 *) max-frame-size))
   (when (> max-frame-size #.most-positive-fixnum)
     (error 'max-frame-size-too-big-error :n max-frame-size))
@@ -385,7 +394,7 @@
                         ;;
                         ;; With Lisp streams, I haven't seen any memory corruptions under very heavy
                         ;; load across multiple machines and both SBCL and CCL.
-                        :unwrap-stream-p nil
+                        :unwrap-stream-p unwrap-stream-p ;; nil
                         :verify (or verify nil))
                        raw-stream))
            (proto (perform-handshake stream host path
@@ -463,23 +472,26 @@
              :secure secure
              clean-args))))
 
-(defun %try-finalize-close (conn &optional (code 1006) (reason ""))
-  (bt:with-recursive-lock-held ((conn-lock conn))
-    (unless (eq (conn-state conn) :closed)
-      (setf (conn-state conn) :closed
-            (conn-close-code conn) code
-            (conn-close-reason conn) reason)
-      (bt:condition-notify (conn-closed-cv conn))
-      t)))
+(defun %%try-finalize-close (conn &optional (code 1006) (reason ""))
+  (unless (eq (conn-state conn) :closed)
+    (setf (conn-state conn) :closed
+          (conn-close-code conn) code
+          (conn-close-reason conn) reason)
+    (bt:condition-notify (conn-closed-cv conn))
+    t))
 
-(defun arm-close-timeout (conn)
+(defun try-finalize-close (conn &optional (code 1006) (reason ""))
+  (bt:with-lock-held ((conn-lock conn))
+    (%%try-finalize-close conn code reason)))
+
+(defun %%arm-close-timeout (conn)
   (let ((timeout (conn-close-timeout conn)))
     (bt:make-thread
      (lambda ()
        (sleep timeout)
        ;; Only set the state + unblock the reader.
        ;; NEVER close the stream/socket from this thread.
-       (when (%try-finalize-close conn 1006)
+       (when (%%try-finalize-close conn 1006)
          (ignore-errors
            (socket-shutdown (conn-socket conn) :input))))
      :name "ws-close-timeout")))
@@ -502,52 +514,84 @@
              (setf end (1+ i)))
     (subseq string 0 end)))
 
-(defun close-connection (conn &optional (code 1000) (reason ""))
+(defun %%close-connection (conn &optional (code 1000) (reason ""))
   (declare (type integer code)
            (type string reason))
-  (bt:with-recursive-lock-held ((conn-lock conn))
-    (when (eq (conn-state conn) :open)
-      (unless (valid-close-status-p code)
-        (setf code 1000))
-      (let* ((reason (utf8-truncate reason 123))
-             (reason-bytes (babel:string-to-octets reason :encoding :utf-8))
-             (payload (make-array (+ 2 (length reason-bytes))
-                                  :element-type '(unsigned-byte 8))))
-        (setf (aref payload 0) (ldb (byte 8 8) code)
-              (aref payload 1) (ldb (byte 8 0) code))
-        (replace payload reason-bytes :start1 2)
-        (handler-case
-            (write-frame (conn-stream conn) #x8 payload)
-          (error ()))
-        (setf (conn-state conn) :closing)
-        (arm-close-timeout conn)))))
+  (when (eq (conn-state conn) :open)
+    (unless (valid-close-status-p code)
+      (setf code 1000))
+    (let* ((reason (utf8-truncate reason 123))
+           (reason-bytes (babel:string-to-octets reason :encoding :utf-8))
+           (payload (make-array (+ 2 (length reason-bytes))
+                                :element-type '(unsigned-byte 8))))
+      (setf (aref payload 0) (ldb (byte 8 8) code)
+            (aref payload 1) (ldb (byte 8 0) code))
+      (replace payload reason-bytes :start1 2)
+      (handler-case
+          (write-frame (conn-stream conn) #x8 payload)
+        (error ()))
+      (setf (conn-state conn) :closing)
+      (%%arm-close-timeout conn))))
+
+(defun close-connection (conn &optional (code 1000) (reason ""))
+  (bt:with-lock-held ((conn-lock conn))
+    (%%close-connection conn code reason)))
+
+(defun %%wait-until-closed (conn &optional (timeout nil))
+  (loop
+    (when (eq (conn-state conn) :closed)
+      (return t))
+    (unless (bt:condition-wait (conn-closed-cv conn)
+                               (conn-lock conn)
+                               :timeout timeout)
+      (return nil))))
 
 (defun wait-until-closed (conn &optional (timeout nil))
-  (bt:with-recursive-lock-held ((conn-lock conn))
-    (loop
-      (when (eq (conn-state conn) :closed)
-        (return t))
-      (unless (bt:condition-wait (conn-closed-cv conn)
-                                 (conn-lock conn)
-                                 :timeout timeout)
-        (return nil)))))
+  (bt:with-lock-held ((conn-lock conn))
+    (%%wait-until-closed conn timeout)))
+
+(defun %%send-text (conn text)
+  (declare (type websocket-connection conn)
+           (type string text)
+           (optimize (speed 3) (safety 1)))
+  (when (%%conn-closed-p conn)
+    (error 'connection-closed-error))
+  (%%write-frame-safely conn #x1
+                        (babel:string-to-octets text :encoding :utf-8)))
 
 (defun send-text (conn text)
   (declare (type websocket-connection conn)
            (type string text)
            (optimize (speed 3) (safety 1)))
-  (when (conn-closed-p conn)
+  (bt:with-lock-held ((conn-lock conn))
+    (%%send-text conn text)))
+
+(defun %%send-binary (conn data)
+  (declare (type websocket-connection conn)
+           (type (array (unsigned-byte 8) (*)) data)
+           (optimize (speed 3) (safety 1)))
+  (when (%%conn-closed-p conn)
     (error 'connection-closed-error))
-  (write-frame-locked conn #x1
-                      (babel:string-to-octets text :encoding :utf-8)))
+  (%%write-frame-safely conn #x2 data))
 
 (defun send-binary (conn data)
   (declare (type websocket-connection conn)
            (type (array (unsigned-byte 8) (*)) data)
            (optimize (speed 3) (safety 1)))
-  (when (conn-closed-p conn)
+  (bt:with-lock-held ((conn-lock conn))
+    (%%send-binary conn data)))
+
+(defun %%send-ping (conn
+                  &optional
+                    (payload #.(make-array 0 :element-type '(unsigned-byte 8))))
+  (declare (type websocket-connection conn)
+           (type (array (unsigned-byte 8) (*)) payload)
+           (optimize (speed 3) (safety 1)))
+  (when (%%conn-closed-p conn)
     (error 'connection-closed-error))
-  (write-frame-locked conn #x2 data))
+  (when (> (length payload) 125)
+    (error 'ping-payload-too-big-error :n-bytes (length payload)))
+  (%%write-frame-safely conn #x9 payload))
 
 (defun send-ping (conn
                   &optional
@@ -555,11 +599,8 @@
   (declare (type websocket-connection conn)
            (type (array (unsigned-byte 8) (*)) payload)
            (optimize (speed 3) (safety 1)))
-  (when (conn-closed-p conn)
-    (error 'connection-closed-error))
-  (when (> (length payload) 125)
-    (error 'ping-payload-too-big-error :n-bytes (length payload)))
-  (write-frame-locked conn #x9 payload))
+  (bt:with-lock-held ((conn-lock conn))
+    (%%send-ping conn payload)))
 
 (defun %ensure-char-buffer (buffer needed)
   (declare (type (or null string) buffer)
@@ -649,11 +690,11 @@
              (finish-close (code &optional (reason ""))
                (declare (type (integer 0 *) code)
                         (type string reason))
-               (%try-finalize-close conn code reason)
+               (try-finalize-close conn code reason)
                (return-from run-message-loop)))
       (unwind-protect
            (loop
-             (bt:with-recursive-lock-held ((conn-lock conn))
+             (bt:with-lock-held ((conn-lock conn))
                (when (eq (conn-state conn) :closed)
                  (return)))
              (multiple-value-bind (opcode payload fin)
@@ -737,7 +778,7 @@
                                       (close-connection conn (if (zerop len-payload) 1000 code))
                                       (finish-close code)))))))
                           (#x9
-                           (ignore-errors (write-frame-locked conn #xA payload))
+                           (ignore-errors (write-frame-safely conn #xA payload))
                            (funcall handler :ping payload))
                           (#xA
                            (funcall handler :pong payload))))
@@ -794,19 +835,19 @@
                        (ignore-errors
                         (close-connection conn 1002 "")))
                      (finish-close 1002 ""))))))
-        (ignore-errors
-         (if (conn-secure-p conn)
-             (progn
-               (close (conn-stream conn))
-               (socket-close (conn-socket conn)))
-             (socket-close (conn-socket conn))))
-        ;; If unwrap-stream-p is t we use the following
-        #|(ignore-errors
-        (if (conn-secure-p conn)
-        (close (conn-stream conn))
-        (socket-close (conn-socket conn))))|#
+        (if unwrap-stream-p
+            (ignore-errors
+             (if (conn-secure-p conn)
+                 (close (conn-stream conn))
+                 (socket-close (conn-socket conn))))
+            (ignore-errors
+             (if (conn-secure-p conn)
+                 (progn
+                   (close (conn-stream conn))
+                   (socket-close (conn-socket conn)))
+                 (socket-close (conn-socket conn)))))
         (multiple-value-bind (code reason)
-            (bt:with-recursive-lock-held ((conn-lock conn))
+            (bt:with-lock-held ((conn-lock conn))
               (values (conn-close-code conn) (conn-close-reason conn)))
           (funcall handler :close (cons code reason)))))))
 
