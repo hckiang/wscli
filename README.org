@@ -43,7 +43,12 @@ Establish a WebSocket connection. Returns the connection object.
                                 ~simple-string~ handed to the user, so the user can safely store the string. If
                                 ~t~, a reusable ~string~ with fill pointer is passed to the user to avoid GC
                                 pressure, but the user promises that he will not store that string because it
-                                will be overwritten when the next message arrives.
+                                will be overwritten after the handler exits. This option only affects
+                                text messages but not ~:binary~, ~:ping~, and ~:pong~. Default is ~nil~.
+- ~borrowed-bin-message-buf~ - boolean. Same as ~reuse-text-message-strbuf~ but for binary data, i.e.,
+                               ~:binary~, ~:ping~, and ~:pong~. Again, this avoids allocation but the user
+                               must understand that the byte array fed to their handler is only valid until
+                               the handler exits. Defaults to ~nil~.
 - ~unwrap-stream-p~ - if ~t~, use the 'raw' stream for cl+ssl and if ~nil~, use Lisp stream. This is directly
                       passed to ~cl+ssl~. Defaults to ~t~.
 

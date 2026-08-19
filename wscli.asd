@@ -1,6 +1,6 @@
 (defsystem "wscli"
   :description "RFC 6455 WebSocket client TLS (cl+ssl)."
-  :version "1.2.0"
+  :version "1.2.1"
   :author "Woodrow Hao Chi Kiang"
   :license "BSD-2-Clause"
   :depends-on ("reckless-utf8"

@@ -27,20 +27,20 @@
             (logxor (aref payload i) (aref mask (mod i 4)))))
     result))
 
-(declaim (ftype (function (stream (integer 0 #.most-positive-fixnum))
-                          (simple-array (unsigned-byte 8) (*)))
+(declaim (ftype (function (stream
+                           (integer 0 #.most-positive-fixnum)
+                           (array (unsigned-byte 8) (*)))
+                          (values))
                 read-exact))
-(defun read-exact (stream n)
+(defun read-exact (stream n buf)
   (declare (type stream stream)
            (type (integer 0 #.most-positive-fixnum) n)
+           (type (simple-array (unsigned-byte 8) (*)) buf)
            (optimize (speed 3) (safety 1)))
-  ;; [GC KILLER]: Shouldn't.
-  (let ((buf (make-array n :element-type '(unsigned-byte 8)))
-        (start 0))
-    (declare (type (simple-array (unsigned-byte 8) (*)) buf)
-             (type (integer 0 #.most-positive-fixnum) start))
+  (let ((start 0))
+    (declare (type (integer 0 #.most-positive-fixnum) start))
     (loop
-      (when (= start n) (return buf))
+      (when (= start n) (return (values)))
       (let ((next (read-sequence buf stream :start start :end n)))
         (when (= next start)
           (error 'end-of-file :stream stream))
@@ -102,6 +102,9 @@
    (reuse-text-message-strbuf :initarg :reuse-text-message-strbuf
                               :initform nil
                               :accessor conn-reuse-text-message-strbuf)
+   (borrowed-bin-message-buf :initarg :borrowed-bin-message-buf
+                             :initform nil
+                             :accessor conn-borrowed-bin-message-buf)
    (unwrap-stream-p :initarg :unwrap-stream-p
                     :initform t
                     :accessor conn-unwrap-stream-p)
@@ -297,12 +300,15 @@
     (%%write-frame-safely conn opcode payload :fin fin :mask mask)))
 
 
-(declaim (ftype (function (stream (integer 0 #.most-positive-fixnum))
+(declaim (ftype (function (stream
+                           (integer 0 #.most-positive-fixnum)
+                           (simple-array (unsigned-byte 8) (8))
+                           (array (unsigned-byte 8) (*)))
                           (values (unsigned-byte 4)
-                                  (simple-array (unsigned-byte 8) (*))
+                                  (integer 0 #.most-positive-fixnum)
                                   boolean))
                 read-frame))
-(defun read-frame (stream max-frame-size)
+(defun read-frame (stream max-frame-size lenbuf framebuf)
   (declare (type stream stream)
            (type (integer 0 #.most-positive-fixnum) max-frame-size)
            (optimize (speed 3) (safety 1)))
@@ -334,22 +340,21 @@
                          :declared-length 126))
                 extended))
              ((= len 127)
-              (let ((lenbuf (read-exact stream 8)))
-                (declare (type (simple-array (unsigned-byte 8) (8)) lenbuf))
-                (let ((extended 0)
-                      (first-byte (aref lenbuf 0)))
-                  (declare (type (unsigned-byte 64) extended)
-                           (type (unsigned-byte 8) first-byte))
-                  (dotimes (i 8)
-                    (declare (type (integer 0 8) i))
-                    (setf extended (+ (ash extended 8) (aref lenbuf i))))
-                  (when (logbitp 7 first-byte)
-                    (error 'payload-msb-set-error))
-                  (when (< extended 65536)
-                    (error 'non-minimal-payload-length-error
-                           :actual-length extended
-                           :declared-length 127))
-                  extended)))
+              (read-exact stream 8 lenbuf)
+              (let ((extended 0)
+                    (first-byte (aref lenbuf 0)))
+                (declare (type (unsigned-byte 64) extended)
+                         (type (unsigned-byte 8) first-byte))
+                (dotimes (i 8)
+                  (declare (type (integer 0 8) i))
+                  (setf extended (+ (ash extended 8) (aref lenbuf i))))
+                (when (logbitp 7 first-byte)
+                  (error 'payload-msb-set-error))
+                (when (< extended 65536)
+                  (error 'non-minimal-payload-length-error
+                         :actual-length extended
+                         :declared-length 127))
+                extended))
              (t len))))
       (declare (type (unsigned-byte 64) payload-len))
       (when (> payload-len most-positive-fixnum)
@@ -358,8 +363,9 @@
           (declare (type (integer 0 #.most-positive-fixnum) payload-len))
         (when (>= payload-len max-frame-size)
           (error 'frame-too-large-error :size payload-len))
-        (let ((data (read-exact stream payload-len)))
-          (values opcode data fin))))))
+        (setf (fill-pointer framebuf) payload-len)
+        (read-exact stream payload-len framebuf)
+        (values opcode payload-len fin)))))
 
 
 (defun connect (host port path
@@ -373,8 +379,10 @@
                   (max-frame-size (* 100 1024 1024))
                   (extra-headers nil)
                   (reuse-text-message-strbuf nil)
+                  (borrowed-bin-message-buf nil)
                   (unwrap-stream-p t))
   (declare (type (integer 0 *) max-frame-size))
+  ;; TODO: max-frame-size must be >= 125 bytes.
   (when (> max-frame-size #.most-positive-fixnum)
     (error 'max-frame-size-too-big-error :n max-frame-size))
   (locally
@@ -399,6 +407,7 @@
                                 :handler handler
                                 :max-frame-size max-frame-size
                                 :reuse-text-message-strbuf reuse-text-message-strbuf
+                                :borrowed-bin-message-buf borrowed-bin-message-buf
                                 :unwrap-stream-p unwrap-stream-p)))
       (setf (conn-subprotocol conn) proto
             (conn-secure-p conn) secure)
@@ -484,7 +493,7 @@
        (sleep timeout)
        ;; Only set the state + unblock the reader.
        ;; NEVER close the stream/socket from this thread.
-       (when (%%try-finalize-close conn 1006)
+       (when (try-finalize-close conn 1006)
          (ignore-errors
            (socket-shutdown (conn-socket conn) :input))))
      :name "ws-close-timeout")))
@@ -631,25 +640,35 @@
 (defun run-message-loop (conn)
   (declare (type websocket-connection conn)
            (optimize (speed 3) (safety 1)))
-  (let ((stream      (conn-stream conn))
-        (handler     (conn-handler conn))
-        (max-frame-size (conn-max-frame-size conn))
-        (msg-opcode  nil)   ; 1 = text, 2 = binary, NIL = no message in progress
-        (msg-buffer  nil)   ; adjustable (unsigned-byte 8) vector or NIL
-        (msg-len     0)
-        (text-buf    (if (conn-reuse-text-message-strbuf conn)
-                         (make-array 4096
-                                     :element-type 'character
-                                     :fill-pointer 0
-                                     :adjustable t)
-                         nil)))
+  (let* ((stream      (conn-stream conn))
+         (handler     (conn-handler conn))
+         (max-frame-size (conn-max-frame-size conn))
+         (msg-opcode  nil)   ; 1 = text, 2 = binary, NIL = no message in progress
+         (msg-buffer  (make-array 0
+                                  :element-type '(unsigned-byte 8)
+                                  :initial-element 0
+                                  :fill-pointer 0
+                                  :adjustable nil))
+         (text-buf    (if (conn-reuse-text-message-strbuf conn)
+                          (make-array 4096
+                                      :element-type 'character
+                                      :fill-pointer 0
+                                      :adjustable t)
+                          nil))
+         (lenbuf     (make-array 8
+                                 :element-type '(unsigned-byte 8)
+                                 :initial-element 0))
+         (framebuf   (make-array max-frame-size
+                                 :element-type '(unsigned-byte 8)
+                                 :initial-element 0
+                                 :fill-pointer 0
+                                 :adjustable nil)))
     (declare (type stream stream)
              (type function handler)
              (type (integer 0 #.most-positive-fixnum) max-frame-size)
              (type (or null (unsigned-byte 4)) msg-opcode)
-             (type (or null (array (unsigned-byte 8) (*))) msg-buffer)
-             (type fixnum msg-len))
-    (labels ((deliver-payload (opcode payload)
+             (type (array (unsigned-byte 8) (*)) msg-buffer))
+    (labels ((hand-out (opcode payload)
                (declare (type (unsigned-byte 4) opcode)
                         (type (array (unsigned-byte 8) (*)) payload))
                (if (= opcode #x1)
@@ -663,23 +682,21 @@
                            (close-connection conn 1007 "Invalid UTF-8")
                            (finish-close 1007 "Invalid UTF-8")))
                        (handler-case
-                           ;; ALLOCATES...
+                           ;; ALLOCATES, but it's the user's choice...
                            (let ((text (babel:octets-to-string payload :encoding :utf-8 :errorp t)))
                              (funcall handler :text text))
                          (babel-encodings:character-decoding-error (e)
                            (funcall handler :error e)
                            (close-connection conn 1007 "Invalid UTF-8")
                            (finish-close 1007 "Invalid UTF-8"))))
-                   (funcall handler :binary payload)))
-             (deliver-message ()
-               (let ((payload (if (zerop msg-len)
-                                  (make-array 0 :element-type '(unsigned-byte 8))
-                                  (subseq msg-buffer 0 msg-len)))) ;ALLOCATES.
-                 (declare (type (simple-array (unsigned-byte 8) (*)) payload))
-                 (deliver-payload msg-opcode payload)
-                 (setf msg-opcode nil
-                       msg-buffer nil
-                       msg-len    0)))
+                   (if (conn-borrowed-bin-message-buf conn)
+                       (funcall handler :binary payload)
+                       ;; ALLOCATES, but it's the user's choice...
+                       (funcall handler :binary (subseq payload 0 (length payload))))))
+             (deliver-msg-buffer ()
+               (hand-out msg-opcode msg-buffer)
+               (setf msg-opcode nil
+                     (fill-pointer msg-buffer) 0))
              (finish-close (code &optional (reason ""))
                (declare (type (integer 0 *) code)
                         (type string reason))
@@ -690,8 +707,8 @@
              (bt:with-lock-held ((conn-lock conn))
                (when (eq (conn-state conn) :closed)
                  (return)))
-             (multiple-value-bind (opcode payload fin)
-                 (handler-case (read-frame stream max-frame-size)
+             (multiple-value-bind (opcode len-payload fin)
+                 (handler-case (read-frame stream max-frame-size lenbuf framebuf)
                    (end-of-file ()
                      (finish-close 1006 "End of file"))
                    (frame-too-large-error (c)
@@ -710,9 +727,8 @@
                        (close-connection conn 1002 ""))
                      (finish-close 1002 "")))
                (declare (type (unsigned-byte 4) opcode)
-                        (type (simple-array (unsigned-byte 8) (*)) payload)
                         (type boolean fin))
-               (let ((len-payload (length payload)))
+               (let ()
                  (declare (type fixnum len-payload))
                  (handler-case 
                      (cond
@@ -729,10 +745,11 @@
                              (t
                               (let* ((code (if (zerop len-payload)
                                                1005
-                                               (+ (ash (aref payload 0) 8)
-                                                  (aref payload 1))))
+                                               (+ (ash (aref framebuf 0) 8)
+                                                  (aref framebuf 1))))
+                                     ;; ALLOCATE but doesn't matter as we're closing anyway.
                                      (reason-bytes (if (> len-payload 2)
-                                                       (subseq payload 2)
+                                                       (subseq framebuf 2)
                                                        (make-array 0 :element-type '(unsigned-byte 8)))))
                                 (declare (type (integer 0 65535) code)
                                          (type (array (unsigned-byte 8) (*)) reason-bytes))
@@ -771,44 +788,47 @@
                                       (close-connection conn (if (zerop len-payload) 1000 code))
                                       (finish-close code)))))))
                           (#x9
-                           (ignore-errors (write-frame-safely conn #xA payload))
-                           (funcall handler :ping payload))
+                           (write-frame-safely conn #xA framebuf)
+                           (funcall handler :ping framebuf))
                           (#xA
-                           (funcall handler :pong payload))))
+                           (funcall handler :pong framebuf))))
                        ((or (= opcode #x1) (= opcode #x2) (= opcode #x0))
                         (cond
                           ((null msg-opcode)
                            (when (= opcode #x0)
                              (error 'unexpected-continuation-frame-error))
                            (if fin
-                               ;; Single-frame message; we avoid more allocations here.
-                               (deliver-payload opcode payload)
-                               (let ((len len-payload))
+                               ;; Single-frame message; we can just directly hand it out already.
+                               (hand-out opcode framebuf)
+                               (progn
+                                 ;; Allocate new buffer for a long fragmented message.
                                  (setf msg-opcode opcode
-                                       msg-buffer (make-array (max len 16)
-                                                              :element-type '(unsigned-byte 8))
-                                       msg-len 0)
-                                 (when (plusp len)
-                                   (replace msg-buffer payload)
-                                   (setf msg-len len)))))
+                                       msg-buffer (make-array (max len-payload 512)
+                                                              :element-type '(unsigned-byte 8)
+                                                              :fill-pointer len-payload))
+                                 (when (plusp len-payload)
+                                   (replace msg-buffer framebuf)))))
                           (t
                            (unless (= opcode #x0)
                              (error 'unexpected-data-frame-error :received-opcode opcode))
-                           (locally
-                               (declare (type (simple-array (unsigned-byte 8) (*)) msg-buffer))
-                             (let ((need (+ msg-len len-payload))
-                                   (dim  (array-dimension msg-buffer 0)))
-                               (declare (type fixnum need dim))
-                               (when (> need dim)
-                                 (let ((new (make-array (max need (* 2 dim))
-                                                        :element-type '(unsigned-byte 8))))
-                                   (replace new msg-buffer :end1 msg-len)
-                                   (setf msg-buffer new)))
-                               (when (plusp len-payload)
-                                 (replace msg-buffer payload :start1 msg-len)
-                                 (incf msg-len len-payload))))
+                           (let ((need (+ (fill-pointer msg-buffer) len-payload))
+                                 (dim  (array-dimension msg-buffer 0)))
+                             (declare (type fixnum need dim))
+                             (when (> need dim)
+                               ;; Allocation: kind of bad actually
+                               (let ((new (make-array (max need (* 2 dim))
+                                                      :element-type '(unsigned-byte 8)
+                                                      :fill-pointer (fill-pointer msg-buffer))))
+                                 (replace new msg-buffer :end1 (fill-pointer msg-buffer))
+                                 (setf msg-buffer new)))
+                             (let* ((old-fill (fill-pointer msg-buffer))
+                                    (new-fill (+ old-fill len-payload)))
+                               (setf (fill-pointer msg-buffer) new-fill)
+                               (replace msg-buffer framebuf
+                                        :start1 old-fill
+                                        :end1 new-fill)))
                            (when fin
-                             (deliver-message)))))
+                             (deliver-msg-buffer)))))
                        (t
                         (error 'unknown-opcode-error :opcode opcode)))
                    (protocol-error (c)
