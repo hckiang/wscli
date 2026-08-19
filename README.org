@@ -24,7 +24,7 @@ for it to finish).
 
 ** API
 
-**** ~connect~ host port path &key handler background origin protocols secure verify hostname max-frame-size extra-headers reuse-text-message-strbuf
+**** ~connect~ host port path &key handler background origin protocols secure verify hostname max-frame-size extra-headers reuse-text-message-strbuf unwrap-stream-p
 
 Establish a WebSocket connection. Returns the connection object.
 
@@ -44,7 +44,9 @@ Establish a WebSocket connection. Returns the connection object.
                                 ~t~, a reusable ~string~ with fill pointer is passed to the user to avoid GC
                                 pressure, but the user promises that he will not store that string because it
                                 will be overwritten when the next message arrives.
-  
+- ~unwrap-stream-p~ - if ~t~, use the 'raw' stream for cl+ssl and if ~nil~, use Lisp stream. This is directly
+                      passed to ~cl+ssl~. Defaults to ~t~.
+
 **** ~connect-url~ url &rest args
 
 Parses ~ws://...~ or ~wss://...~ URLs and calls ~connect~.  

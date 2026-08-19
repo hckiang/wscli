@@ -386,17 +386,7 @@
                        (cl+ssl:make-ssl-client-stream
                         raw-stream
                         :hostname (or hostname host)
-                        ;; :unwrap-stream-p t is supposedly more direct and faster, but it causes
-                        ;; FreeBSD Clozure CL to fail with corrupt memory inside the SSL library
-                        ;; for unknown reasons, especially under heavy load.
-                        ;;
-                        ;; Interestingly, fukamachi's websocket-driver fails the exact same way
-                        ;; on the same machine (they use :unwrap-stream-p t), so I believe this is
-                        ;; not a wscli bug per-se. For safety reasons, we use Lisp stream here.
-                        ;;
-                        ;; With Lisp streams, I haven't seen any memory corruptions under very heavy
-                        ;; load across multiple machines and both SBCL and CCL.
-                        :unwrap-stream-p unwrap-stream-p ;; nil
+                        :unwrap-stream-p unwrap-stream-p
                         :verify (or verify nil))
                        raw-stream))
            (proto (perform-handshake stream host path
