@@ -41,11 +41,10 @@
              (type (integer 0 #.most-positive-fixnum) start))
     (loop
       (when (= start n) (return buf))
-      (let ((count (read-sequence buf stream :start start :end n)))
-        (declare (type fixnum count))
-        (when (zerop count)
+      (let ((next (read-sequence buf stream :start start :end n)))
+        (when (= next start)
           (error 'end-of-file :stream stream))
-        (incf start count)))))
+        (setf start next)))))
 
 (defun write-crlf (stream)
   (declare (type stream stream)
@@ -102,7 +101,10 @@
                    :type (integer 0 #.most-positive-fixnum))
    (reuse-text-message-strbuf :initarg :reuse-text-message-strbuf
                               :initform nil
-                              :accessor reuse-text-message-strbuf)
+                              :accessor conn-reuse-text-message-strbuf)
+   (unwrap-stream-p :initarg :unwrap-stream-p
+                    :initform t
+                    :accessor conn-unwrap-stream-p)
    (listener-thread :initform nil :accessor conn-listener-thread)
    (lock         :initform (bt:make-lock "ws-lock")
                  :accessor conn-lock)
@@ -406,7 +408,8 @@
                                 :stream stream
                                 :handler handler
                                 :max-frame-size max-frame-size
-                                :reuse-text-message-strbuf reuse-text-message-strbuf)))
+                                :reuse-text-message-strbuf reuse-text-message-strbuf
+                                :unwrap-stream-p unwrap-stream-p)))
       (setf (conn-subprotocol conn) proto
             (conn-secure-p conn) secure)
       (when background
@@ -644,7 +647,7 @@
         (msg-opcode  nil)   ; 1 = text, 2 = binary, NIL = no message in progress
         (msg-buffer  nil)   ; adjustable (unsigned-byte 8) vector or NIL
         (msg-len     0)
-        (text-buf    (if (reuse-text-message-strbuf conn)
+        (text-buf    (if (conn-reuse-text-message-strbuf conn)
                          (make-array 4096
                                      :element-type 'character
                                      :fill-pointer 0
@@ -660,7 +663,7 @@
                (declare (type (unsigned-byte 4) opcode)
                         (type (array (unsigned-byte 8) (*)) payload))
                (if (= opcode #x1)
-                   (if (reuse-text-message-strbuf conn)
+                   (if (conn-reuse-text-message-strbuf conn)
                        (handler-case
                            (progn
                              (setf text-buf (%utf8-decode-borrowed payload text-buf))
@@ -748,7 +751,7 @@
                                     (error 'invalid-close-code-error :received-code code)))
                                 (if (plusp (length reason-bytes))
                                     (let ((received-reason-str
-                                            (if (reuse-text-message-strbuf conn)
+                                            (if (conn-reuse-text-message-strbuf conn)
                                                 (handler-case
                                                     (let ((maybe-same-buf
                                                             (%utf8-decode-borrowed reason-bytes text-buf)))
@@ -769,7 +772,7 @@
                                       (declare (type string received-reason-str))
                                       ;; because finish-close / handler
                                       ;; may outlive the next reuse of text-buf...
-                                      (when (reuse-text-message-strbuf conn)
+                                      (when (conn-reuse-text-message-strbuf conn)
                                         (setf received-reason-str (copy-seq received-reason-str)))
                                       ;; Reply (or no-op if we already sent a Close) then finish.
                                       (close-connection conn (if (zerop len-payload) 1000 code))
@@ -835,7 +838,7 @@
                        (ignore-errors
                         (close-connection conn 1002 "")))
                      (finish-close 1002 ""))))))
-        (if unwrap-stream-p
+        (if (conn-unwrap-stream-p conn)
             (ignore-errors
              (if (conn-secure-p conn)
                  (close (conn-stream conn))
