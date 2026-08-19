@@ -20,7 +20,13 @@ most typical use, it is less designed with concurrency and robust long-running s
 compared to ~wscli~. For example, ~wscli~ provides better thread-safety for multiple threads
 writing to the same socket and some request closing; ~wscli~ also does safer gentle shutdown
 (the user's handler code can be in a foreign library doing any side-effects and we should wait
-for it to finish).
+for it to finish). ~wscli~ never crashes in socket shutdown.
+
+~wscli~ also has a unique 'borrowed string' mode that tries to avoids allocating a string just to decode
+utf8 and hand it to the user, while the user promises to never store the string. This is especially useful
+for sockets that receives many small packets in high frequency. If latency is important to your
+appication, and you are stuck with SBCL, this mode can ease a significant amount of allocation volume
+(given that your handler doesn't allocate much).
 
 ** API
 
@@ -167,7 +173,7 @@ BSD 2-clause.
 
 ** Common Lisp Implementations
 
-The library is known to work on SBCL, CCL and ECL.
+The library is known to work on LispWorks, SBCL, CCL and ECL.
 
 However, ECL’s execution/memory management model is ill‑suited to the library’s
 concurrent I/O performance; multiple streams or heavy loads are thus inadvisable on ECL.
