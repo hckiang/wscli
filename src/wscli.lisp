@@ -1,3 +1,6 @@
+#+lispworks8
+(require "comm")
+
 (in-package :wscli)
 
 (defun make-websocket-key ()
