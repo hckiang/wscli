@@ -36,7 +36,7 @@
   (declare (type stream stream)
            (type (integer 0 #.most-positive-fixnum) n)
            (type (simple-array (unsigned-byte 8) (*)) buf)
-           (optimize (speed 3) (safety 1)))
+           (optimize (speed 3) (safety 0)))
   (let ((start 0))
     (declare (type (integer 0 #.most-positive-fixnum) start))
     (loop
@@ -311,7 +311,7 @@
 (defun read-frame (stream max-frame-size lenbuf framebuf)
   (declare (type stream stream)
            (type (integer 0 #.most-positive-fixnum) max-frame-size)
-           (optimize (speed 3) (safety 1)))
+           (optimize (speed 3) (safety 0)))
   (let* ((b0 (the (unsigned-byte 8) (read-byte stream)))
          (b1 (the (unsigned-byte 8) (read-byte stream)))
          (fin (logbitp 7 b0))
@@ -369,55 +369,69 @@
 
 
 (defun connect (host port path
-                &key (handler (lambda (type data) (declare (ignore type data))))
-                  (background t)
-                  (origin nil)
-                  (protocols nil)
-                  (secure nil)
-                  (verify :required)
-                  (hostname nil)     ; SNI hostname (defaults to HOST)
-                  (max-frame-size (* 100 1024 1024))
-                  (extra-headers nil)
-                  (reuse-text-message-strbuf nil)
-                  (borrowed-bin-message-buf nil)
-                  (unwrap-stream-p t))
+                     &key (handler (lambda (type data) (declare (ignore type data))))
+                     (background t)
+                     (origin nil)
+                     (protocols nil)
+                     (secure nil)
+                     (verify :required)
+                     (hostname nil)     ; SNI hostname (defaults to HOST)
+                     (max-frame-size (* 100 1024 1024))
+                     (extra-headers nil)
+                     (reuse-text-message-strbuf nil)
+                     (borrowed-bin-message-buf nil)
+                     (unwrap-stream-p t))
   (declare (type (integer 0 *) max-frame-size))
   ;; TODO: max-frame-size must be >= 125 bytes.
   (when (> max-frame-size #.most-positive-fixnum)
     (error 'max-frame-size-too-big-error :n max-frame-size))
   (locally
-      (declare (type (integer 0 #.most-positive-fixnum) max-frame-size))
-    (let* ((socket (socket-connect host port
-                                   :element-type '(unsigned-byte 8)))
-           (raw-stream (socket-stream socket))
-           (stream (if secure
-                       (cl+ssl:make-ssl-client-stream
-                        raw-stream
-                        :hostname (or hostname host)
-                        :unwrap-stream-p unwrap-stream-p
-                        :verify (or verify nil))
-                       raw-stream))
-           (proto (perform-handshake stream host path
-                                     :origin origin
-                                     :protocols protocols
-                                     :extra-headers extra-headers))
-           (conn (make-instance 'websocket-connection
-                                :socket socket
-                                :stream stream
-                                :handler handler
-                                :max-frame-size max-frame-size
-                                :reuse-text-message-strbuf reuse-text-message-strbuf
-                                :borrowed-bin-message-buf borrowed-bin-message-buf
-                                :unwrap-stream-p unwrap-stream-p)))
-      (setf (conn-subprotocol conn) proto
-            (conn-secure-p conn) secure)
-      (when background
-        (setf (conn-listener-thread conn)
-              (bt:make-thread
-               (lambda ()
-                 (run-message-loop conn))
-               :name (format nil "ws-listener-~A:~A" host port))))
-      conn)))
+    (declare (type (integer 0 #.most-positive-fixnum) max-frame-size))
+    (let*
+      #+lispworks8
+      ((stream
+        (progn
+          (when (and secure (not verify))
+            (warn ":verify nil isn't supported on LispWorks 8 #:comm secure streams. Turning on SSL verification."))
+          (comm:open-tcp-stream
+           host port
+           :element-type '(unsigned-byte 8)
+           :ssl-ctx secure
+           :tlsext-host-name (or hostname host)
+           :errorp t)))
+        (socket stream))
+      #-lispworks8
+      ((socket (socket-connect host port
+                               :element-type '(unsigned-byte 8)))
+       (raw-stream (socket-stream socket))
+       (stream (if secure
+                   (cl+ssl:make-ssl-client-stream
+                    raw-stream
+                    :hostname (or hostname host)
+                    :unwrap-stream-p unwrap-stream-p
+                    :verify (or verify nil))
+                 raw-stream)))
+      (let ((proto (perform-handshake stream host path
+                                      :origin origin
+                                      :protocols protocols
+                                      :extra-headers extra-headers))
+            (conn (make-instance 'websocket-connection
+                                 :socket socket
+                                 :stream stream
+                                 :handler handler
+                                 :max-frame-size max-frame-size
+                                 :reuse-text-message-strbuf reuse-text-message-strbuf
+                                 :borrowed-bin-message-buf borrowed-bin-message-buf
+                                 :unwrap-stream-p unwrap-stream-p)))
+        (setf (conn-subprotocol conn) proto
+              (conn-secure-p conn) secure)
+        (when background
+          (setf (conn-listener-thread conn)
+                (bt:make-thread
+                 (lambda ()
+                   (run-message-loop conn))
+                 :name (format nil "ws-listener-~A:~A" host port))))
+        conn))))
 
 (defun connect-url (url &rest args &key &allow-other-keys)
   (declare (type string url))
@@ -494,6 +508,10 @@
        ;; Only set the state + unblock the reader.
        ;; NEVER close the stream/socket from this thread.
        (when (try-finalize-close conn 1006)
+         #+lispworks8
+         (ignore-errors
+           (comm:socket-stream-shutdown (conn-socket conn) :input))
+         #-lispworks8
          (ignore-errors
            (socket-shutdown (conn-socket conn) :input))))
      :name "ws-close-timeout")))
@@ -555,7 +573,7 @@
 (defun %%send-text (conn text)
   (declare (type websocket-connection conn)
            (type string text)
-           (optimize (speed 3) (safety 1)))
+           (optimize (speed 3) (safety 0)))
   (when (%%conn-closed-p conn)
     (error 'connection-closed-error))
   (%%write-frame-safely conn #x1
@@ -639,7 +657,7 @@
 
 (defun run-message-loop (conn)
   (declare (type websocket-connection conn)
-           (optimize (speed 3) (safety 1)))
+           (optimize (speed 3) (safety 0)))
   (let* ((stream      (conn-stream conn))
          (handler     (conn-handler conn))
          (max-frame-size (conn-max-frame-size conn))
@@ -848,6 +866,9 @@
                        (ignore-errors
                         (close-connection conn 1002 "")))
                      (finish-close 1002 ""))))))
+        #+lispworks8
+        (close (conn-stream conn))
+        #-lispworks8
         (if (conn-unwrap-stream-p conn)
             (ignore-errors
              (if (conn-secure-p conn)
